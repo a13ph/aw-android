@@ -49,7 +49,7 @@ class WebWatcher : AccessibilityService() {
     // formatted identically no matter which browser/view-variant produced it.
     private fun extractUrl(packageName: String, event: AccessibilityEvent): String? = when (packageName) {
         "com.android.chrome" -> extractTextByViewId(event, "com.android.chrome:id/url_bar")
-        "org.mozilla.firefox" ->
+        "org.mozilla.firefox", "org.mozilla.fennec_fdroid" ->
             // Compose toolbar (current)
             extractFirefoxUrl(event)
                 // View-based toolbar (older Firefox versions)
@@ -199,6 +199,7 @@ class WebWatcher : AccessibilityService() {
         internal val KNOWN_BROWSER_PACKAGES = setOf(
             "com.android.chrome",
             "org.mozilla.firefox",
+            "org.mozilla.fennec_fdroid",
             "com.sec.android.app.sbrowser",
             "com.opera.browser",
             "com.microsoft.emmx"
