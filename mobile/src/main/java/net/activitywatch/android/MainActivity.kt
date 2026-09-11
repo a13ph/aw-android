@@ -87,7 +87,14 @@ class MainActivity : AppCompatActivity(), NavigationView.OnNavigationItemSelecte
 
         // If first time, or usage not allowed, show onboarding activity
         val prefs = AWPreferences(this)
-        if (prefs.isFirstTime() || !UsageStatsWatcher.isUsageAllowed(this)) {
+        val usageAllowed = UsageStatsWatcher.isUsageAllowed(this)
+        if (prefs.isFirstTime() && usageAllowed) {
+            // Usage access was granted before the first open (e.g. `appops set` from a
+            // shell): the only thing onboarding insists on is already done.
+            Log.i(TAG, "Usage access already granted, skipping onboarding")
+            prefs.setFirstTimeRunFlag()
+        }
+        if (prefs.isFirstTime() || !usageAllowed) {
             Log.i(TAG, "First time or usage not allowed, starting onboarding activity")
             val intent = Intent(this, OnboardingActivity::class.java)
             startActivity(intent)

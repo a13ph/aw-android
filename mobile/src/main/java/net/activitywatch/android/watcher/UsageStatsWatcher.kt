@@ -67,6 +67,32 @@ class UsageStatsWatcher constructor(val context: Context) {
             return getAccessibilityPermissionStatus(context)
         }
 
+        /**
+         * Arms the same hourly LOG_DATA alarm as setupAlarm(), but only when none is
+         * pending: re-arming pushes the first run an hour out, so a process that
+         * restarts more often than hourly would otherwise never log. Returns true
+         * when it armed one.
+         */
+        fun armAlarmIfMissing(context: Context): Boolean {
+            val intent = Intent(context, AlarmReceiver::class.java).apply {
+                action = "net.activitywatch.android.watcher.LOG_DATA"
+            }
+            val existing = PendingIntent.getBroadcast(
+                context, 0, intent, PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+            )
+            if (existing != null) return false
+            val pendingIntent = PendingIntent.getBroadcast(context, 0, intent, PendingIntent.FLAG_IMMUTABLE)
+            val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            val interval = AlarmManager.INTERVAL_HOUR
+            alarmManager.setInexactRepeating(
+                AlarmManager.ELAPSED_REALTIME,
+                SystemClock.elapsedRealtime() + interval,
+                interval,
+                pendingIntent
+            )
+            return true
+        }
+
         private fun getUsageStatsPermissionsStatus(context: Context): Boolean {
             val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
             val mode = appOps.checkOpNoThrow(
