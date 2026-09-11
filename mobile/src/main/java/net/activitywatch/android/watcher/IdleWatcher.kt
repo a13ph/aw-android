@@ -148,7 +148,7 @@ private fun File.readLongOrNull(): Long? =
  *   the session and agent being the open window's, or "unknown" outside one (its own
  *   bucket: heartbeats
  *   merge only into the latest event, so mixing it with the windows would split them),
- *   and a touch within [INJECT_S] s of an `input` or `monkey` run is injected: logged
+ *   and a touch within [INJECT_S] s of an `input`, `monkey` or `bu` run is injected: logged
  *   with "adb".
  *
  * Touches logged "cc" or "adb" never make the user not-afk; the afk bucket holds only
@@ -165,7 +165,8 @@ class IdleWatcher private constructor(private val context: Context) {
         private const val INJECT_S = 5L
         private const val SHELL_SPAN_S = 3.0
         private const val SHELL_PULSE_S = 10.0
-        private val INJECTORS = setOf("input", "monkey")
+        // bu (adb backup) is followed by a touch within a second, too soon for a finger
+        private val INJECTORS = setOf("input", "monkey", "bu")
         private const val SHELL_FILTER =
             "Calling main entry com\\.android\\.commands\\.|START u[0-9]+ .* from uid 2000"
         private const val CLIENT = "aw-phone-idle-watcher"
