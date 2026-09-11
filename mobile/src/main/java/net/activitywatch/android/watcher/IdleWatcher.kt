@@ -77,6 +77,20 @@ internal fun parseShellLine(line: String): ShellCommand? {
     return null
 }
 
+/** The cc-driving marker (line 1 `<start epoch>`, line 2 `<end epoch>` once closed) with
+ * who drove, from cc-driving.who `<start epoch> <session> <agent>`. The who line counts
+ * only when its epoch is the marker's start; otherwise both read as "unknown". */
+internal data class CcMarker(val start: Long, val end: Long?, val session: String, val agent: String)
+
+private val WS_RE = Regex("""\s+""")
+
+internal fun parseCcMarker(lines: List<String>, who: String?): CcMarker? {
+    val start = lines.getOrNull(0)?.trim()?.split(WS_RE)?.getOrNull(0)?.toLongOrNull() ?: return null
+    val end = lines.getOrNull(1)?.trim()?.split(WS_RE)?.getOrNull(0)?.toLongOrNull()
+    val w = who?.trim()?.split(WS_RE)?.takeIf { it.getOrNull(0)?.toLongOrNull() == start }
+    return CcMarker(start, end, w?.getOrNull(1) ?: "unknown", w?.getOrNull(2) ?: "unknown")
+}
+
 // Log lines that explain a process death: init stopping services, USB state, app kills,
 // ANRs and crashes, low-memory kills.
 private val KILL_RE = Regex(
@@ -104,13 +118,17 @@ private fun File.readLongOrNull(): Long? =
  *   [ALIVE_S] s while polling), screen-on, screen-off, errors; also in logcat, tag aw-idle
  * - aw-idle-kills.log: log lines explaining kills (needs READ_LOGS)
  * - dropbox/: this app's ANR and crash reports, copied before the system rotates them
- * - cc-driving: while it exists (line 1 = start epoch, line 2 = end epoch once closed),
- *   touches are an automated driver's, not the user's: logged with "cc", and the window
- *   recorded as a span `{by: cc}` in `aw-watcher-cc-phone_<host>`; cc-driving.log is
- *   the ledger of closed windows.
+ * - cc-driving: while it exists (line 1 = start epoch, line 2 = end epoch once closed;
+ *   cc-driving.who = `<start epoch> <session> <agent>` names the driver), touches are an
+ *   automated driver's, not the user's: logged
+ *   with "cc <session short>", and the window recorded as a span
+ *   `{by: cc, session, session_short, agent}` in `aw-watcher-cc-phone_<host>`;
+ *   cc-driving.log is the ledger of closed windows, `<start> <end> <session> <agent>`.
  * - aw-idle-shell.log: `<epoch.ms> <cmd> [app]` for every command the adb shell ran,
  *   followed live from logcat (needs READ_LOGS). Each is also a span
- *   `{by: adb, cmd[, app]}` in `aw-watcher-adb_<host>` (its own bucket: heartbeats
+ *   `{by: adb, cmd[, app], session, session_short, agent}` in `aw-watcher-adb_<host>`,
+ *   the session and agent being the open window's, or "unknown" outside one (its own
+ *   bucket: heartbeats
  *   merge only into the latest event, so mixing it with the windows would split them),
  *   and a touch within [INJECT_S] s of an `input` or `monkey` run is injected: logged
  *   with "adb".
@@ -157,6 +175,7 @@ class IdleWatcher private constructor(private val context: Context) {
     private val dropboxDir = File(dir, "dropbox")
     private val dropboxSince = File(dir, "aw-idle-dropbox.since")
     private val ccFlag = File(dir, "cc-driving")
+    private val ccWho = File(dir, "cc-driving.who")
     private val ccLedger = File(dir, "cc-driving.log")
     private val shellLog = File(dir, "aw-idle-shell.log")
     private val shellSince = File(dir, "aw-idle-shell.since")
@@ -270,10 +289,11 @@ class IdleWatcher private constructor(private val context: Context) {
 
         var ccS = 0L
         var ccE: Long? = null
-        if (ccFlag.exists()) {
-            val lines = try { ccFlag.readLines() } catch (e: Exception) { emptyList() }
-            ccS = lines.getOrNull(0)?.trim()?.toLongOrNull() ?: 0L
-            ccE = lines.getOrNull(1)?.trim()?.toLongOrNull()
+        val marker = readMarker()
+        val ccData = whoData(JSONObject().put("by", "cc"), marker)
+        if (marker != null) {
+            ccS = marker.start
+            ccE = marker.end
             if (ccE == null && ccS > 0 && now - ccS > CC_STALE_S) {
                 life("cc-stale", "window opened $ccS never closed - dropped")
                 ccFlag.delete()
@@ -283,18 +303,18 @@ class IdleWatcher private constructor(private val context: Context) {
         val driving = ccS > 0 && ccE == null
         if (driving) {
             if (ccSeen != ccS) {
-                ccBeat(ccS)
+                ccBeat(ccS, ccData)
                 ccSeen = ccS
             }
-            ccBeat(now)
+            ccBeat(now, ccData)
         } else if (ccS > 0 && ccE != null && ccDone != ccS) {
             if (ccSeen == ccS) {
-                ccBeat(ccE)   // extends the span the live beats built
-            } else {          // opened and closed between two looks: one event
-                post(ccBucket, ccS, (ccE - ccS).toDouble(), JSONObject().put("by", "cc"), 0.0)
+                ccBeat(ccE, ccData)   // extends the span the live beats built
+            } else {                  // opened and closed between two looks: one event
+                post(ccBucket, ccS, (ccE - ccS).toDouble(), ccData, 0.0)
             }
             ccDone = ccS
-            append(ccLedger, "$ccS $ccE\n", LIFE_MAX)
+            append(ccLedger, "$ccS $ccE ${marker?.session} ${marker?.agent}\n", LIFE_MAX)
             life("cc-window", "${iso(ccS)} to ${iso(ccE)}")
         }
 
@@ -319,7 +339,8 @@ class IdleWatcher private constructor(private val context: Context) {
         // a closed window is dropped once the user touches again or his idle is decided
         if (ccE != null && (by == null || now - ccE > THRESH_S)) ccFlag.delete()
         if (touch > lastLogged + 1) {
-            append(tapsLog, "$touch $wake ${by ?: ""}\n", TAPS_MAX)
+            val tag = if (by == "cc") "cc ${ccData.optString("session_short")}" else by ?: ""
+            append(tapsLog, "$touch $wake $tag\n", TAPS_MAX)
             lastLogged = touch
         }
         val newState = if (by == null && wake == "Awake" && ago / 1000 < THRESH_S) "not-afk" else "afk"
@@ -390,7 +411,24 @@ class IdleWatcher private constructor(private val context: Context) {
         try { shellSince.writeText("${c.epochMs}\n") } catch (e: Exception) { }
         val data = JSONObject().put("by", "adb").put("cmd", c.cmd)
         if (c.app != null) data.put("app", c.app)
-        post(adbBucket, t, SHELL_SPAN_S, data, SHELL_PULSE_S)
+        // read the marker now, not the tick's copy: a window opened a second ago counts
+        val m = readMarker()?.takeIf { t >= it.start - 1 && (it.end == null || t <= it.end + 1) }
+        post(adbBucket, t, SHELL_SPAN_S, whoData(data, m), SHELL_PULSE_S)
+    }
+
+    private fun readMarker(): CcMarker? =
+        if (!ccFlag.exists()) null
+        else try {
+            val who = if (ccWho.exists()) ccWho.readText() else null
+            parseCcMarker(ccFlag.readLines(), who)
+        } catch (e: Exception) { null }
+
+    // Adds who drove: the window's session and agent, or "unknown" with no window.
+    private fun whoData(data: JSONObject, m: CcMarker?): JSONObject {
+        val session = m?.session ?: "unknown"
+        return data.put("session", session)
+            .put("session_short", if (session == "unknown") session else session.take(8))
+            .put("agent", m?.agent ?: "unknown")
     }
 
     // End (epoch s) of the newest-ending plain afk event among the bucket's recent
@@ -439,8 +477,8 @@ class IdleWatcher private constructor(private val context: Context) {
         if (t > lastBeat) lastBeat = t
     }
 
-    private fun ccBeat(t: Long) {
-        post(ccBucket, t, 0.0, JSONObject().put("by", "cc"), (INTERVAL_S * 3).toDouble())
+    private fun ccBeat(t: Long, data: JSONObject) {
+        post(ccBucket, t, 0.0, data, (INTERVAL_S * 3).toDouble())
     }
 
     private fun post(bucketId: String, t: Long, duration: Double, data: JSONObject, pulsetime: Double) {

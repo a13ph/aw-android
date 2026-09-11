@@ -36,6 +36,27 @@ class IdleWatcherParseTest {
     }
 
     @Test
+    fun whoFileNamesTheDriver() {
+        val who = "1789151174 9d1c1602-3270-4c27-9a50-4cae3e200f12 phone-agent\n"
+        assertEquals(
+            CcMarker(1789151174L, null, "9d1c1602-3270-4c27-9a50-4cae3e200f12", "phone-agent"),
+            parseCcMarker(listOf("1789151174"), who)
+        )
+        assertEquals(
+            CcMarker(1789151174L, 1789151508L, "9d1c1602-3270-4c27-9a50-4cae3e200f12", "phone-agent"),
+            parseCcMarker(listOf("1789151174", "1789151508"), who)
+        )
+    }
+
+    @Test
+    fun staleOrMissingWhoReadsAsUnknown() {
+        val stale = "1789140000 9d1c1602-3270-4c27-9a50-4cae3e200f12 phone-agent"
+        assertEquals(CcMarker(1789151174L, null, "unknown", "unknown"), parseCcMarker(listOf("1789151174"), stale))
+        assertEquals(CcMarker(1789151174L, null, "unknown", "unknown"), parseCcMarker(listOf("1789151174"), null))
+        assertNull(parseCcMarker(listOf(""), null))
+    }
+
+    @Test
     fun shellInputRunIsACommand() {
         val line = "         1789151502.181 shell 27646 27646 D AndroidRuntime: " +
             "Calling main entry com.android.commands.input.Input"
