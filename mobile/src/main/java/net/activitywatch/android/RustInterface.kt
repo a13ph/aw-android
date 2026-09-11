@@ -30,10 +30,21 @@ class RustInterface(context: Context? = null) {
 
         System.loadLibrary("aw_server")
 
-        initialize()
-        if (context != null) {
-            setDataDir(context.filesDir.absolutePath)
-            appVersionString(context)?.let { setVersionOverride(it) }
+        // The native side opens its datastore lazily on first use through an unguarded
+        // `static mut`: two threads making their first call at the same time each open
+        // one, and a call on the losing one never returned (seen with WebWatcher's and
+        // IdleWatcher's threads starting together). So set up and open it here, once,
+        // under a lock; every instance returns only after the datastore exists.
+        synchronized(initLock) {
+            initialize()
+            if (context != null) {
+                setDataDir(context.filesDir.absolutePath)
+                appVersionString(context)?.let { setVersionOverride(it) }
+                if (!datastoreOpened) {
+                    getBuckets()
+                    datastoreOpened = true
+                }
+            }
         }
     }
 
@@ -64,6 +75,8 @@ class RustInterface(context: Context? = null) {
 
     companion object {
         var serverStarted = false
+        private val initLock = Any()
+        private var datastoreOpened = false
     }
 
     private external fun initialize()
