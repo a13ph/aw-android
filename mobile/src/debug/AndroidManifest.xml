@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Development permissions: never asked from the user, granted from a shell with
+         `pm grant <package> <permission>`. Without them IdleWatcher stays idle.
+         DUMP: read the last user-activity time from `dumpsys power`.
+         READ_LOGS: keep the log lines and dropbox reports (ANRs, crashes) that explain
+         why the app's process died. -->
+    <uses-permission
+        android:name="android.permission.DUMP"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission
+        android:name="android.permission.READ_LOGS"
+        tools:ignore="ProtectedPermissions" />
+</manifest>

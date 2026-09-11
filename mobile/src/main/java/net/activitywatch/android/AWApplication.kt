@@ -3,6 +3,8 @@ package net.activitywatch.android
 import android.app.Application
 import android.content.Intent
 import android.util.Log
+import net.activitywatch.android.watcher.IdleWatcher
+import net.activitywatch.android.watcher.UsageStatsWatcher
 
 private const val TAG = "AWApplication"
 
@@ -22,5 +24,13 @@ class AWApplication : Application() {
             // (ForegroundServiceStartNotAllowedException); MainActivity starts it later.
             Log.w(TAG, "Could not start BackgroundService on process start", e)
         }
+
+        // The hourly usage alarm used to be armed only from MainActivity, i.e. never
+        // after a reboot or a kill until someone opened the app.
+        if (UsageStatsWatcher.isUsageAllowed(this) && UsageStatsWatcher.armAlarmIfMissing(this)) {
+            Log.i(TAG, "Armed the hourly usage alarm on process start")
+        }
+
+        IdleWatcher.start(this)
     }
 }
