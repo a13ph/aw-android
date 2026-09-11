@@ -19,6 +19,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.ConcurrentLinkedDeque
 import net.activitywatch.android.RustInterface
 import net.activitywatch.android.deviceHostname
 import net.activitywatch.android.models.Event
@@ -52,6 +53,30 @@ internal fun parsePowerDump(lines: Sequence<String>): PowerSample {
     return PowerSample(ago, wake)
 }
 
+/** A command the adb shell (uid 2000) ran, seen in logcat: `cmd` is the java command
+ * (input, monkey, uiautomator, ...) or "start" for an activity it launched (`app`). */
+internal data class ShellCommand(val epochMs: Long, val cmd: String, val app: String?)
+
+private val LOG_RE = Regex("""^\s*(\d+)\.(\d{3})\s+(\S+)\s+\d+\s+\d+\s+\w\s+(\S+?)\s*: (.*)$""")
+private val ENTRY_RE = Regex("""^Calling main entry com\.android\.commands\.(\w+)\.""")
+private val START_RE = Regex("""^START u\d+ \{.*?\bcmp=([^/ }]+).*\} from uid 2000\b""")
+
+/** Reads one `logcat -v epoch,uid` line; null unless it is a shell command or launch. */
+internal fun parseShellLine(line: String): ShellCommand? {
+    val m = LOG_RE.find(line) ?: return null
+    val (sec, ms, uid, tag, msg) = m.destructured
+    val t = sec.toLong() * 1000 + ms.toLong()
+    if (tag == "AndroidRuntime" && (uid == "shell" || uid == "2000")) {
+        val e = ENTRY_RE.find(msg) ?: return null
+        return ShellCommand(t, e.groupValues[1], null)
+    }
+    if (tag == "ActivityTaskManager" || tag == "ActivityManager") {
+        val s = START_RE.find(msg) ?: return null
+        return ShellCommand(t, "start", s.groupValues[1])
+    }
+    return null
+}
+
 // Log lines that explain a process death: init stopping services, USB state, app kills,
 // ANRs and crashes, low-memory kills.
 private val KILL_RE = Regex(
@@ -80,9 +105,18 @@ private fun File.readLongOrNull(): Long? =
  * - aw-idle-kills.log: log lines explaining kills (needs READ_LOGS)
  * - dropbox/: this app's ANR and crash reports, copied before the system rotates them
  * - cc-driving: while it exists (line 1 = start epoch, line 2 = end epoch once closed),
- *   touches are an automated driver's, not the user's: logged with "cc", afk with by=cc,
- *   and the window recorded as a span in `aw-watcher-cc-phone_<host>`; cc-driving.log
- *   is the ledger of closed windows.
+ *   touches are an automated driver's, not the user's: logged with "cc", and the window
+ *   recorded as a span `{by: cc}` in `aw-watcher-cc-phone_<host>`; cc-driving.log is
+ *   the ledger of closed windows.
+ * - aw-idle-shell.log: `<epoch.ms> <cmd> [app]` for every command the adb shell ran,
+ *   followed live from logcat (needs READ_LOGS). Each is also a span
+ *   `{by: adb, cmd[, app]}` in `aw-watcher-adb_<host>` (its own bucket: heartbeats
+ *   merge only into the latest event, so mixing it with the windows would split them),
+ *   and a touch within [INJECT_S] s of an `input` or `monkey` run is injected: logged
+ *   with "adb".
+ *
+ * Touches logged "cc" or "adb" never make the user not-afk; the afk bucket holds only
+ * the user's own state.
  */
 class IdleWatcher private constructor(private val context: Context) {
 
@@ -92,6 +126,12 @@ class IdleWatcher private constructor(private val context: Context) {
         private const val ALIVE_S = 120L
         private const val NO_DUMP_RETRY_S = 60L
         private const val CC_STALE_S = 7200L
+        private const val INJECT_S = 5L
+        private const val SHELL_SPAN_S = 3.0
+        private const val SHELL_PULSE_S = 10.0
+        private val INJECTORS = setOf("input", "monkey")
+        private const val SHELL_FILTER =
+            "Calling main entry com\\.android\\.commands\\.|START u[0-9]+ .* from uid 2000"
         private const val CLIENT = "aw-phone-idle-watcher"
         private const val TAPS_MAX = 2_000_000L
         private const val LIFE_MAX = 200_000L
@@ -118,11 +158,14 @@ class IdleWatcher private constructor(private val context: Context) {
     private val dropboxSince = File(dir, "aw-idle-dropbox.since")
     private val ccFlag = File(dir, "cc-driving")
     private val ccLedger = File(dir, "cc-driving.log")
+    private val shellLog = File(dir, "aw-idle-shell.log")
+    private val shellSince = File(dir, "aw-idle-shell.since")
 
     private val power = context.getSystemService(Context.POWER_SERVICE) as PowerManager
     private val host = deviceHostname(context)
     private val bucket = "aw-watcher-afk_$host"
     private val ccBucket = "aw-watcher-cc-phone_$host"
+    private val adbBucket = "aw-watcher-adb_$host"
     private val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
     }
@@ -141,6 +184,11 @@ class IdleWatcher private constructor(private val context: Context) {
     private var ccDone = 0L
     private var fails = 0
     private var dumpOk: Boolean? = null
+
+    // Epoch s of recent input/monkey runs. Written by the logcat thread the moment it
+    // reads the line, which comes before the injection, so a tick sees it in time.
+    private val injections = ConcurrentLinkedDeque<Long>()
+    @Volatile private var shellThread: Thread? = null
 
     private val tick = Runnable { safeTick() }
 
@@ -180,6 +228,7 @@ class IdleWatcher private constructor(private val context: Context) {
             ContextCompat.registerReceiver(
                 context, screenReceiver, filter, null, handler, ContextCompat.RECEIVER_EXPORTED
             )
+            ensureShellWatch()
             safeTick()
         }
     }
@@ -212,6 +261,7 @@ class IdleWatcher private constructor(private val context: Context) {
             ensureBuckets()
             capture()
         }
+        ensureShellWatch()
         if (!granted(Manifest.permission.DUMP)) {
             if (dumpOk != false) life("no-dump", "android.permission.DUMP not granted (pm grant)")
             dumpOk = false
@@ -263,6 +313,8 @@ class IdleWatcher private constructor(private val context: Context) {
         if (ccS > 0 && touch >= ccS - 1) {
             if (driving || (ccE != null && touch <= ccE + 1)) by = "cc"
         }
+        while ((injections.peekFirst() ?: now) < now - 600) injections.pollFirst()
+        if (by == null && injections.any { touch >= it - 1 && touch <= it + INJECT_S }) by = "adb"
         if (by == null) alTouch = touch
         // a closed window is dropped once the user touches again or his idle is decided
         if (ccE != null && (by == null || now - ccE > THRESH_S)) ccFlag.delete()
@@ -286,13 +338,59 @@ class IdleWatcher private constructor(private val context: Context) {
             } else {
                 // stretch the idle span up to the touch that ended it (the screen may
                 // have been off for hours), then start use at that touch
-                if (state == "afk" && touch > lastBeat) beat(touch, "afk", null)
-                beat(touch, "not-afk", null)
+                if (state == "afk" && touch > lastBeat) beat(touch, "afk")
+                beat(touch, "not-afk")
             }
         }
-        beat(now, newState, by)
+        beat(now, newState)
         state = newState
         return INTERVAL_S
+    }
+
+    // Follows logcat for what the adb shell (uid 2000) runs: java commands such as
+    // input, monkey and uiautomator, and activities it launches. The tick restarts it
+    // when it has died, from the last line it handled.
+    private fun ensureShellWatch() {
+        if (shellThread?.isAlive == true) return
+        if (!granted(Manifest.permission.READ_LOGS)) return
+        val since = shellSince.readLongOrNull() ?: (System.currentTimeMillis() - 60_000)
+        shellThread = Thread({ followShell(since) }, "aw-idle-shell").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun followShell(since: Long) {
+        try {
+            val from = String.format(Locale.US, "%d.%03d", since / 1000, since % 1000)
+            val p = ProcessBuilder(
+                "logcat", "-b", "main,system", "-v", "epoch,uid", "-T", from, "-e", SHELL_FILTER
+            ).redirectErrorStream(true).start()
+            try {
+                p.inputStream.bufferedReader().forEachLine { line ->
+                    val c = parseShellLine(line)
+                    if (c != null && c.epochMs > since) {
+                        if (c.cmd in INJECTORS) injections.addLast(c.epochMs / 1000)
+                        handler.post { onShell(c) }
+                    }
+                }
+            } finally {
+                p.destroy()
+            }
+            handler.post { life("shell-watch-end", "logcat exited") }
+        } catch (t: Throwable) {
+            handler.post { life("error", "shell watch: $t") }
+        }
+    }
+
+    private fun onShell(c: ShellCommand) {
+        val t = c.epochMs / 1000
+        val stamp = String.format(Locale.US, "%d.%03d", t, c.epochMs % 1000)
+        append(shellLog, "$stamp ${c.cmd} ${c.app ?: ""}\n", LIFE_MAX)
+        try { shellSince.writeText("${c.epochMs}\n") } catch (e: Exception) { }
+        val data = JSONObject().put("by", "adb").put("cmd", c.cmd)
+        if (c.app != null) data.put("app", c.app)
+        post(adbBucket, t, SHELL_SPAN_S, data, SHELL_PULSE_S)
     }
 
     // End (epoch s) of the newest-ending plain afk event among the bucket's recent
@@ -335,9 +433,8 @@ class IdleWatcher private constructor(private val context: Context) {
         return if (lastBeat > 0 && t - lastBeat > base) (t - lastBeat + base).toDouble() else base.toDouble()
     }
 
-    private fun beat(t: Long, status: String, by: String?) {
+    private fun beat(t: Long, status: String) {
         val data = JSONObject().put("status", status)
-        if (by != null) data.put("by", by)
         post(bucket, t, 0.0, data, pulseFor(t))
         if (t > lastBeat) lastBeat = t
     }
@@ -369,6 +466,7 @@ class IdleWatcher private constructor(private val context: Context) {
         try {
             ri?.createBucketHelper(bucket, "afkstatus", CLIENT)
             ri?.createBucketHelper(ccBucket, "cc-driving", CLIENT)
+            ri?.createBucketHelper(adbBucket, "adb-shell", CLIENT)
         } catch (e: Exception) {
             fails++
             Log.w(TAG, "bucket creation failed", e)
