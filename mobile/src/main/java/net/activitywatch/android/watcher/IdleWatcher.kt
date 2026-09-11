@@ -275,12 +275,13 @@ class IdleWatcher private constructor(private val context: Context) {
             if (newState == "afk") {
                 // idle began at the user's last touch: one event covering [then, now];
                 // the heartbeats below extend it. After a restart the bucket may
-                // already hold this idle span, left by the previous process: the
-                // server merges a heartbeat only into the latest-starting event, so
-                // start it there and it extends that event instead of adding another
-                // over it. After a not-afk event the data differs and it is inserted.
+                // already hold part of this idle span, left by the previous process,
+                // so the new span starts where that one ends: it then merges into it
+                // or continues it, never lying over it. (Merging into "the latest
+                // event" is not enough: an afk span and the not-afk span before it
+                // start at the same touch, and either can come back as the latest.)
                 val from = if (alTouch > 0) alTouch else touch
-                val start = latestAfkStartReaching(from) ?: from
+                val start = (afkCoveredUntil(from) ?: from).coerceAtMost(now)
                 post(bucket, start, (now - start).toDouble(), JSONObject().put("status", "afk"), (INTERVAL_S * 3).toDouble())
             } else {
                 // stretch the idle span up to the touch that ended it (the screen may
@@ -294,21 +295,25 @@ class IdleWatcher private constructor(private val context: Context) {
         return INTERVAL_S
     }
 
-    // Start (epoch s) of the bucket's latest event when it is a plain afk event that
-    // reaches back to `from` (ends no earlier than `from` minus the pulse), else null.
-    private fun latestAfkStartReaching(from: Long): Long? {
+    // End (epoch s) of the newest-ending plain afk event among the bucket's recent
+    // ones, when it ends after `from`; else null. In a normal not-afk -> afk change
+    // every afk event ended before the last touch, so this only fires after a restart.
+    private fun afkCoveredUntil(from: Long): Long? {
         val rust = ri ?: return null
         return try {
-            val events = rust.getEventsJSON(bucket, 1)
-            if (events.length() == 0) return null
-            val e = events.getJSONObject(0)
-            val data = e.getJSONObject("data")
-            if (data.length() != 1 || data.optString("status") != "afk") return null
-            val start = OffsetDateTime.parse(e.getString("timestamp")).toEpochSecond()
-            val end = start + e.getDouble("duration").toLong()
-            if (end + INTERVAL_S * 3 >= from && start <= now()) start else null
+            val events = rust.getEventsJSON(bucket, 10)
+            var latestEnd: Long? = null
+            for (i in 0 until events.length()) {
+                val e = events.getJSONObject(i)
+                val data = e.getJSONObject("data")
+                if (data.length() != 1 || data.optString("status") != "afk") continue
+                val start = OffsetDateTime.parse(e.getString("timestamp")).toEpochSecond()
+                val end = start + e.getDouble("duration").toLong()
+                if (latestEnd == null || end > latestEnd) latestEnd = end
+            }
+            latestEnd?.takeIf { it > from }
         } catch (ex: Exception) {
-            Log.w(TAG, "could not read the latest afk event", ex)
+            Log.w(TAG, "could not read the recent afk events", ex)
             null
         }
     }
