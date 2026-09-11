@@ -1,9 +1,14 @@
 package net.activitywatch.android.watcher
 
 import android.accessibilityservice.AccessibilityService
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import java.util.concurrent.atomic.AtomicReference
 import net.activitywatch.android.RustInterface
 import org.json.JSONObject
 
@@ -20,12 +25,21 @@ private fun extractTextByViewId(event: AccessibilityEvent, viewId: String): Stri
     return null
 }
 
+// A browser page fires content-changed events many times a second. Within one window
+// the URL is looked up at most this often (trailing, so the last change is still seen);
+// a window change is looked up at once.
+private const val SAME_WINDOW_INTERVAL_MS = 2_000L
+private const val STATS_EVERY_MS = 60_000L
+
+private val FIREFOX_PACKAGES = setOf("org.mozilla.firefox", "org.mozilla.fennec_fdroid")
+
 class WebWatcher : AccessibilityService() {
 
     // The toolbar is a sibling of the content area, so we search from the window root.
     // findAccessibilityNodeInfosByViewId requires "package:id/name" format and silently
-    // rejects bare testTag names, so we traverse manually.
-    private fun extractFirefoxUrl(event: AccessibilityEvent): String? {
+    // rejects bare testTag names, so we traverse manually - breadth-first and capped (see
+    // findNode), because the toolbar is shallow and the page below it can be huge.
+    private fun extractFirefoxUrl(): String? {
         val root = rootInActiveWindow ?: return null
         try {
             val found = findNode(root) { it.viewIdResourceName == "ADDRESSBAR_URL_BOX" }
@@ -42,8 +56,25 @@ class WebWatcher : AccessibilityService() {
     private val lastDiagnosticDump = mutableMapOf<String, Long>()
 
     private var ri : RustInterface? = null
-    private var lastWindowId: Int? = null
+    // Written on the worker thread, also read on the main thread to pick the throttle.
+    @Volatile private var lastWindowId: Int? = null
     private val sessionTracker = BrowserSessionTracker()
+
+    // Lookups walk another app's view tree over binder, so they run on this thread and
+    // never on the main thread: a walk on the main thread blocked the app's other
+    // components long enough for Android to kill it for an ANR.
+    private val worker = HandlerThread("aw-web", Process.THREAD_PRIORITY_BACKGROUND)
+    private var workerHandler: Handler? = null
+    // Newest event not yet looked up; older ones are dropped, only the latest state matters.
+    private val pending = AtomicReference<AccessibilityEvent?>(null)
+    @Volatile private var lastLookupAt = 0L
+    private val lookup = Runnable { lookUpPending() }
+
+    // Written on the worker thread only.
+    private var statsSince = 0L
+    private var statsLookups = 0
+    private var statsMs = 0L
+    private var statsMaxMs = 0L
 
     // Applies stripProtocol uniformly to whatever extractor matched, so the logged url is
     // formatted identically no matter which browser/view-variant produced it.
@@ -51,7 +82,7 @@ class WebWatcher : AccessibilityService() {
         "com.android.chrome" -> extractTextByViewId(event, "com.android.chrome:id/url_bar")
         "org.mozilla.firefox", "org.mozilla.fennec_fdroid" ->
             // Compose toolbar (current)
-            extractFirefoxUrl(event)
+            extractFirefoxUrl()
                 // View-based toolbar (older Firefox versions)
                 ?: extractTextByViewId(event, "org.mozilla.firefox:id/url_bar_title")
                 ?: extractTextByViewId(event, "org.mozilla.firefox:id/mozac_browser_toolbar_url_view")
@@ -68,21 +99,77 @@ class WebWatcher : AccessibilityService() {
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "Creating WebWatcher")
-        try {
-            ri = RustInterface(applicationContext).also { it.createBucketHelper(bucket_id, "web.tab.current") }
-        } catch (ex: Throwable) {
-            // Catch Throwable (not just Exception) because System.loadLibrary() throws
-            // UnsatisfiedLinkError (an Error subclass) when the native library is missing.
-            Log.e(TAG, "Failed to initialize RustInterface: ${ex.message}")
+        worker.start()
+        workerHandler = Handler(worker.looper)
+        workerHandler?.post {
+            try {
+                ri = RustInterface(applicationContext).also { it.createBucketHelper(bucket_id, "web.tab.current") }
+            } catch (ex: Throwable) {
+                // Catch Throwable (not just Exception) because System.loadLibrary() throws
+                // UnsatisfiedLinkError (an Error subclass) when the native library is missing.
+                Log.e(TAG, "Failed to initialize RustInterface: ${ex.message}")
+            }
         }
     }
 
-    // TODO: This method is called very often, which might affect performance. Future optimizations needed.
+    override fun onDestroy() {
+        workerHandler?.removeCallbacksAndMessages(null)
+        worker.quitSafely()
+        pending.getAndSet(null)?.recycle()
+        super.onDestroy()
+    }
+
+    // Main thread: copy the event and hand it to the worker. No binder calls here.
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         if (shouldIgnoreEvent(event)) {
             return
         }
+        val handler = workerHandler ?: return
+        // The framework recycles `event` when this returns; the copy keeps the source
+        // node's ids, so the worker can still fetch it.
+        pending.getAndSet(AccessibilityEvent.obtain(event))?.recycle()
+        val sameWindow = event.windowId == lastWindowId
+        val wait = if (sameWindow) {
+            (lastLookupAt + SAME_WINDOW_INTERVAL_MS - SystemClock.uptimeMillis()).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+        handler.removeCallbacks(lookup)
+        handler.postDelayed(lookup, wait)
+    }
 
+    private fun lookUpPending() {
+        val event = pending.getAndSet(null) ?: return
+        val started = SystemClock.uptimeMillis()
+        lastLookupAt = started
+        try {
+            handleEvent(event)
+        } catch (ex: Exception) {
+            Log.e(TAG, ex.message ?: ex.toString())
+        } finally {
+            event.recycle()
+        }
+        recordLookup(SystemClock.uptimeMillis() - started)
+    }
+
+    // One info line a minute: how many lookups ran and what they cost.
+    private fun recordLookup(ms: Long) {
+        val now = SystemClock.uptimeMillis()
+        if (statsSince == 0L) statsSince = now
+        statsLookups++
+        statsMs += ms
+        if (ms > statsMaxMs) statsMaxMs = ms
+        if (now - statsSince >= STATS_EVERY_MS) {
+            Log.i(TAG, "lookups=$statsLookups total_ms=$statsMs max_ms=$statsMaxMs in ${(now - statsSince) / 1000}s")
+            statsSince = now
+            statsLookups = 0
+            statsMs = 0
+            statsMaxMs = 0
+        }
+    }
+
+    // Worker thread.
+    private fun handleEvent(event: AccessibilityEvent) {
         val packageName = event.packageName?.toString()
         val isKnownBrowser = packageName != null && packageName in KNOWN_BROWSER_PACKAGES
 
@@ -100,27 +187,28 @@ class WebWatcher : AccessibilityService() {
             return
         }
 
-        try {
-            event.source?.let { source ->
-                try {
-                    val browser = packageName!!
-                    val newUrl = extractUrl(browser, event)
+        val browser = packageName!!
+        val newUrl = extractUrl(browser, event)
 
-                    if (newUrl == null) {
-                        maybeDumpTree(browser)
-                    } else {
-                        handleUrl(newUrl, newBrowser = browser)
-                    }
-                    findWebView(source)?.let { webView ->
-                        handleWindowTitle(webView.text.toString())
-                        if (webView !== source) webView.recycle()
-                    }
-                } finally {
-                    source.recycle()
+        if (newUrl == null) {
+            maybeDumpTree(browser)
+        } else {
+            handleUrl(newUrl, newBrowser = browser)
+        }
+        if (browser in FIREFOX_PACKAGES) {
+            // Firefox's page content is not a descendant of the event source (see
+            // findWebView), so the search could only ever walk the page and fail.
+            return
+        }
+        event.source?.let { source ->
+            try {
+                findWebView(source)?.let { webView ->
+                    handleWindowTitle(webView.text.toString())
+                    if (webView !== source) webView.recycle()
                 }
+            } finally {
+                source.recycle()
             }
-        } catch(ex : Exception) {
-            Log.e(TAG, ex.message ?: ex.toString())
         }
     }
 
