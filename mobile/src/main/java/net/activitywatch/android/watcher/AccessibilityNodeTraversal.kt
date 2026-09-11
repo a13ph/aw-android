@@ -2,31 +2,61 @@ package net.activitywatch.android.watcher
 
 import android.view.accessibility.AccessibilityNodeInfo
 
-// Generic depth-first search for the first descendant (including `node` itself) matching
-// `predicate`. Every rejected node visited along the way is recycled; the matching node is
-// left un-recycled for the caller to use and eventually recycle.
-internal fun findNode(node: AccessibilityNodeInfo, predicate: (AccessibilityNodeInfo) -> Boolean): AccessibilityNodeInfo? {
+// Every getChild() can be a binder call into the foreground app, so a walk over a large
+// tree (a long page in a browser) costs seconds of CPU. Searches are capped at this many
+// fetched nodes.
+internal const val DEFAULT_MAX_NODES = 400
+
+// Breadth-first search for the first node (including `node` itself) matching `predicate`,
+// fetching at most `maxNodes` descendants. Breadth-first finds shallow chrome such as a
+// browser toolbar before descending into the page. Every node fetched and rejected is
+// recycled; the match is left un-recycled for the caller (who must not recycle it twice
+// when it is `node` itself).
+internal fun findNode(
+    node: AccessibilityNodeInfo,
+    maxNodes: Int = DEFAULT_MAX_NODES,
+    predicate: (AccessibilityNodeInfo) -> Boolean
+): AccessibilityNodeInfo? {
     if (predicate(node)) return node
-    for (i in 0 until node.childCount) {
-        val child = node.getChild(i) ?: continue
-        val found = findNode(child, predicate)
-        if (found != null) {
-            if (found !== child) child.recycle()
-            return found
+    val queue = java.util.ArrayDeque<AccessibilityNodeInfo>()
+    var budget = maxNodes
+    var found: AccessibilityNodeInfo? = null
+    var parent: AccessibilityNodeInfo? = node
+    while (parent != null && found == null && budget > 0) {
+        val count = parent.childCount
+        for (i in 0 until count) {
+            if (budget <= 0) break
+            budget--
+            val child = parent.getChild(i) ?: continue
+            if (predicate(child)) {
+                found = child
+                break
+            }
+            queue.addLast(child)
         }
-        child.recycle()
+        if (parent !== node) parent.recycle()
+        parent = queue.pollFirst()
     }
-    return null
+    if (parent != null && parent !== node) parent.recycle()
+    while (true) queue.pollFirst()?.recycle() ?: break
+    return found
 }
 
-// Generic depth-first visit of `node` and every descendant. `node` itself is left for the
-// caller to recycle (they own that reference); every descendant is recycled once its own
-// subtree has been fully visited.
-internal fun forEachNode(node: AccessibilityNodeInfo, depth: Int = 0, visit: (AccessibilityNodeInfo, Int) -> Unit) {
+// Depth-first visit of `node` and its descendants, at most `maxNodes` of them. `node`
+// itself is left for the caller to recycle; every descendant is recycled once its own
+// subtree has been visited.
+internal fun forEachNode(
+    node: AccessibilityNodeInfo,
+    depth: Int = 0,
+    budget: IntArray = intArrayOf(DEFAULT_MAX_NODES * 5),
+    visit: (AccessibilityNodeInfo, Int) -> Unit
+) {
     visit(node, depth)
     for (i in 0 until node.childCount) {
+        if (budget[0] <= 0) return
+        budget[0]--
         val child = node.getChild(i) ?: continue
-        forEachNode(child, depth + 1, visit)
+        forEachNode(child, depth + 1, budget, visit)
         child.recycle()
     }
 }
