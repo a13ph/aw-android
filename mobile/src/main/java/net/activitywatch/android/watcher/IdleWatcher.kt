@@ -91,6 +91,24 @@ internal fun parseCcMarker(lines: List<String>, who: String?): CcMarker? {
     return CcMarker(start, end, w?.getOrNull(1) ?: "unknown", w?.getOrNull(2) ?: "unknown")
 }
 
+/** Who made a touch: "cc" for a driver's inside its window, "adb" for an injected one
+ * outside any window, null for the user's own finger. A touch is injected when an input
+ * or monkey run started within [-1, +injectS] s of it. Inside a window a touch with no
+ * run near it is the user's finger - the user can take the phone mid-window - but only
+ * while logcat is being followed (`shellLive`); without it the window's claim stands. */
+internal fun classifyTouch(
+    touch: Long, winStart: Long, winEnd: Long?, injections: Iterable<Long>, shellLive: Boolean,
+    injectS: Long
+): String? {
+    val injected = injections.any { touch >= it - 1 && touch <= it + injectS }
+    val inWindow = winStart > 0 && touch >= winStart - 1 && (winEnd == null || touch <= winEnd + 1)
+    return when {
+        inWindow && (injected || !shellLive) -> "cc"
+        injected -> "adb"
+        else -> null
+    }
+}
+
 // Log lines that explain a process death: init stopping services, USB state, app kills,
 // ANRs and crashes, low-memory kills.
 private val KILL_RE = Regex(
@@ -119,8 +137,8 @@ private fun File.readLongOrNull(): Long? =
  * - aw-idle-kills.log: log lines explaining kills (needs READ_LOGS)
  * - dropbox/: this app's ANR and crash reports, copied before the system rotates them
  * - cc-driving: while it exists (line 1 = start epoch, line 2 = end epoch once closed;
- *   cc-driving.who = `<start epoch> <session> <agent>` names the driver), touches are an
- *   automated driver's, not the user's: logged
+ *   cc-driving.who = `<start epoch> <session> <agent>` names the driver), touches near an
+ *   input run are the driver's, and others the user's finger ([classifyTouch]): logged
  *   with "cc <session short>", and the window recorded as a span
  *   `{by: cc, session, session_short, agent}` in `aw-watcher-cc-phone_<host>`;
  *   cc-driving.log is the ledger of closed windows, `<start> <end> <session> <agent>`.
@@ -329,12 +347,8 @@ class IdleWatcher private constructor(private val context: Context) {
         dumpOk = true
         val wake = sample.wakefulness ?: ""
         val touch = now - ago / 1000
-        var by: String? = null
-        if (ccS > 0 && touch >= ccS - 1) {
-            if (driving || (ccE != null && touch <= ccE + 1)) by = "cc"
-        }
         while ((injections.peekFirst() ?: now) < now - 600) injections.pollFirst()
-        if (by == null && injections.any { touch >= it - 1 && touch <= it + INJECT_S }) by = "adb"
+        val by = classifyTouch(touch, ccS, ccE, injections, shellThread?.isAlive == true, INJECT_S)
         if (by == null) alTouch = touch
         // a closed window is dropped once the user touches again or his idle is decided
         if (ccE != null && (by == null || now - ccE > THRESH_S)) ccFlag.delete()

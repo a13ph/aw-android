@@ -36,6 +36,22 @@ class IdleWatcherParseTest {
     }
 
     @Test
+    fun touchInsideAWindowIsTheDriversOnlyWhenInjected() {
+        val runs = listOf(1000L)
+        assertEquals("cc", classifyTouch(1002L, 900L, null, runs, true, 5L))
+        assertNull(classifyTouch(1100L, 900L, null, runs, true, 5L))     // the user's finger
+        assertEquals("cc", classifyTouch(1100L, 900L, null, runs, false, 5L)) // no logcat: window wins
+    }
+
+    @Test
+    fun touchOutsideAWindowIsAdbOnlyWhenInjected() {
+        val runs = listOf(1000L)
+        assertEquals("adb", classifyTouch(1004L, 0L, null, runs, true, 5L))
+        assertEquals("adb", classifyTouch(1004L, 800L, 850L, runs, true, 5L))  // window long closed
+        assertNull(classifyTouch(1010L, 0L, null, runs, true, 5L))
+    }
+
+    @Test
     fun whoFileNamesTheDriver() {
         val who = "1789151174 9d1c1602-3270-4c27-9a50-4cae3e200f12 phone-agent\n"
         assertEquals(
