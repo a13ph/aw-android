@@ -216,6 +216,17 @@ jobs:
         cat android.jks.age | age -d -i android.jks.key -o android.jks
         rm android.jks.key
 
+    - name: Restore pinned debug keystore
+      # Fork-only: sign every debug build with the same key, so a new build
+      # installs over the previous one instead of needing an uninstall.
+      env:
+        DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+      run: |
+        if [ -n "$DEBUG_KEYSTORE_B64" ]; then
+          mkdir -p ~/.android
+          echo "$DEBUG_KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
+        fi
+
     - name: Assemble
       env:
         JKS_STOREPASS: ${{ secrets.KEY_ANDROID_JKS_STOREPASS }}
