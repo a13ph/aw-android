@@ -24,6 +24,7 @@ import net.activitywatch.android.deviceHostname
 import net.activitywatch.android.models.Event
 import org.json.JSONObject
 import org.threeten.bp.Instant
+import org.threeten.bp.OffsetDateTime
 
 private const val TAG = "aw-idle"
 
@@ -273,12 +274,14 @@ class IdleWatcher private constructor(private val context: Context) {
         if (newState != state) {
             if (newState == "afk") {
                 // idle began at the user's last touch: one event covering [then, now];
-                // the heartbeats below extend it. Sent as a heartbeat, so after a
-                // restart it merges into the afk event the previous process left,
-                // which starts at that same touch, instead of duplicating it; after a
-                // not-afk event the data differs and it is inserted as a new event
+                // the heartbeats below extend it. After a restart the bucket may
+                // already hold this idle span, left by the previous process: the
+                // server merges a heartbeat only into the latest-starting event, so
+                // start it there and it extends that event instead of adding another
+                // over it. After a not-afk event the data differs and it is inserted.
                 val from = if (alTouch > 0) alTouch else touch
-                post(bucket, from, (now - from).toDouble(), JSONObject().put("status", "afk"), (INTERVAL_S * 3).toDouble())
+                val start = latestAfkStartReaching(from) ?: from
+                post(bucket, start, (now - start).toDouble(), JSONObject().put("status", "afk"), (INTERVAL_S * 3).toDouble())
             } else {
                 // stretch the idle span up to the touch that ended it (the screen may
                 // have been off for hours), then start use at that touch
@@ -289,6 +292,25 @@ class IdleWatcher private constructor(private val context: Context) {
         beat(now, newState, by)
         state = newState
         return INTERVAL_S
+    }
+
+    // Start (epoch s) of the bucket's latest event when it is a plain afk event that
+    // reaches back to `from` (ends no earlier than `from` minus the pulse), else null.
+    private fun latestAfkStartReaching(from: Long): Long? {
+        val rust = ri ?: return null
+        return try {
+            val events = rust.getEventsJSON(bucket, 1)
+            if (events.length() == 0) return null
+            val e = events.getJSONObject(0)
+            val data = e.getJSONObject("data")
+            if (data.length() != 1 || data.optString("status") != "afk") return null
+            val start = OffsetDateTime.parse(e.getString("timestamp")).toEpochSecond()
+            val end = start + e.getDouble("duration").toLong()
+            if (end + INTERVAL_S * 3 >= from && start <= now()) start else null
+        } catch (ex: Exception) {
+            Log.w(TAG, "could not read the latest afk event", ex)
+            null
+        }
     }
 
     private fun samplePower(): PowerSample {
