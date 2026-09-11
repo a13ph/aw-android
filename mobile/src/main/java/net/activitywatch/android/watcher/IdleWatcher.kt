@@ -273,9 +273,12 @@ class IdleWatcher private constructor(private val context: Context) {
         if (newState != state) {
             if (newState == "afk") {
                 // idle began at the user's last touch: one event covering [then, now];
-                // the heartbeats below extend it
+                // the heartbeats below extend it. Sent as a heartbeat, so after a
+                // restart it merges into the afk event the previous process left,
+                // which starts at that same touch, instead of duplicating it; after a
+                // not-afk event the data differs and it is inserted as a new event
                 val from = if (alTouch > 0) alTouch else touch
-                post(bucket, from, (now - from).toDouble(), JSONObject().put("status", "afk"), 0.0)
+                post(bucket, from, (now - from).toDouble(), JSONObject().put("status", "afk"), (INTERVAL_S * 3).toDouble())
             } else {
                 // stretch the idle span up to the touch that ended it (the screen may
                 // have been off for hours), then start use at that touch

@@ -20,22 +20,29 @@ class RustInterface(context: Context? = null) {
     private val appContext: Context? = context?.applicationContext
 
     init {
-        // NOTE: This doesn't work, probably because I can't get gradle to not strip symbols on
-        // release builds
-        Os.setenv("RUST_BACKTRACE", "1", true)
-
-        if (context != null) {
-            Os.setenv("SQLITE_TMPDIR", context.cacheDir.absolutePath, true)
-        }
-
-        System.loadLibrary("aw_server")
-
         // The native side opens its datastore lazily on first use through an unguarded
         // `static mut`: two threads making their first call at the same time each open
         // one, and a call on the losing one never returned (seen with WebWatcher's and
         // IdleWatcher's threads starting together). So set up and open it here, once,
         // under a lock; every instance returns only after the datastore exists.
         synchronized(initLock) {
+            // setenv is not thread-safe: two constructors racing here, or one racing a
+            // native thread's getenv, crashed the process with SIGSEGV in __findenv.
+            // So the environment is written once, before any native thread exists.
+            if (!backtraceSet) {
+                // NOTE: This doesn't work, probably because I can't get gradle to not
+                // strip symbols on release builds
+                Os.setenv("RUST_BACKTRACE", "1", true)
+                backtraceSet = true
+            }
+            // Set by the first instance with a context (one without, e.g. in
+            // BucketsContent, must not leave it to be written again later).
+            if (context != null && !tmpdirSet) {
+                Os.setenv("SQLITE_TMPDIR", context.cacheDir.absolutePath, true)
+                tmpdirSet = true
+            }
+
+            System.loadLibrary("aw_server")
             initialize()
             if (context != null) {
                 setDataDir(context.filesDir.absolutePath)
@@ -77,6 +84,8 @@ class RustInterface(context: Context? = null) {
         var serverStarted = false
         private val initLock = Any()
         private var datastoreOpened = false
+        private var backtraceSet = false
+        private var tmpdirSet = false
     }
 
     private external fun initialize()
