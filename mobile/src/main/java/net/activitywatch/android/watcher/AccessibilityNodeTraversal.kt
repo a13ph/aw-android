@@ -18,7 +18,7 @@ internal fun findNode(
     predicate: (AccessibilityNodeInfo) -> Boolean
 ): AccessibilityNodeInfo? {
     if (predicate(node)) return node
-    val queue = ArrayDeque<AccessibilityNodeInfo>()
+    val queue = java.util.ArrayDeque<AccessibilityNodeInfo>()
     var budget = maxNodes
     var found: AccessibilityNodeInfo? = null
     var parent: AccessibilityNodeInfo? = node
@@ -35,10 +35,10 @@ internal fun findNode(
             queue.addLast(child)
         }
         if (parent !== node) parent.recycle()
-        parent = queue.removeFirstOrNull()
+        parent = queue.pollFirst()
     }
     if (parent != null && parent !== node) parent.recycle()
-    while (queue.isNotEmpty()) queue.removeFirst().recycle()
+    while (true) queue.pollFirst()?.recycle() ?: break
     return found
 }
 

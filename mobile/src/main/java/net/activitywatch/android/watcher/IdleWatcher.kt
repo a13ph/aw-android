@@ -1,12 +1,12 @@
 package net.activitywatch.android.watcher
 
 import android.Manifest
-import android.app.DropBoxManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.os.DropBoxManager
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.PowerManager
