@@ -3,5 +3,7 @@
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="true">127.0.0.1</domain>
         <domain includeSubdomains="true">localhost</domain>
+        <!-- probook's tailnet address, for ProbookSync: WireGuard already encrypts it -->
+        <domain includeSubdomains="false">100.67.195.123</domain>
     </domain-config>
 </network-security-config>

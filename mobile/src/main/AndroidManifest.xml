@@ -18,6 +18,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!-- ProbookSync holds the CPU for a sync run started by its idle alarm -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <meta-data android:name="com.samsung.android.vr.application.mode" android:value="dual" />
 
     <application
@@ -71,6 +73,17 @@
             <intent-filter>
                 <action android:name="net.activitywatch.android.watcher.LOG_DATA" />
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Starts a probook sync run: ProbookSync's alarm, and the break buttons
+             (HTTP Shortcuts sendIntent) right after a tap. A run only pushes
+             this phone's own data, so any sender can do no more than hurry it. -->
+        <receiver
+            android:name=".ProbookSyncReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="net.activitywatch.android.PROBOOK_SYNC" />
             </intent-filter>
         </receiver>
 
