@@ -50,6 +50,38 @@ class UrlExtractionTest {
     }
 
     @Test
+    fun `private tab counter is incognito`() {
+        assertEquals(true, parseTabCounterIncognito("Private Tabs Open: 1. Tap to switch tabs.", ENGLISH_TAB_COUNTER_LABELS))
+    }
+
+    @Test
+    fun `normal and non-private tab counters are not incognito`() {
+        assertEquals(false, parseTabCounterIncognito("Tabs Open: 12. Tap to switch tabs.", ENGLISH_TAB_COUNTER_LABELS))
+        assertEquals(false, parseTabCounterIncognito("Non-private Tabs Open: 3. Tap to switch tabs.", ENGLISH_TAB_COUNTER_LABELS))
+    }
+
+    @Test
+    fun `other descriptions say nothing about the mode`() {
+        assertNull(parseTabCounterIncognito(null, ENGLISH_TAB_COUNTER_LABELS))
+        assertNull(parseTabCounterIncognito("The tab counter toolbar button.", ENGLISH_TAB_COUNTER_LABELS))
+        assertNull(parseTabCounterIncognito(" example.com. Search or enter address", ENGLISH_TAB_COUNTER_LABELS))
+    }
+
+    @Test
+    fun `label prefix is the text before the count`() {
+        assertEquals("Private Tabs Open: ", tabCounterLabelPrefix("Private Tabs Open: %1\$s. Tap to switch tabs."))
+        assertNull(tabCounterLabelPrefix("%1\$s open tabs"))
+        assertNull(tabCounterLabelPrefix("no count here"))
+    }
+
+    @Test
+    fun `localized labels are matched alongside the english ones`() {
+        val labels = ENGLISH_TAB_COUNTER_LABELS + TabCounterLabels(listOf("Private Tabs geöffnet: "), listOf("Tabs geöffnet: "))
+        assertEquals(true, parseTabCounterIncognito("Private Tabs geöffnet: 2", labels))
+        assertEquals(false, parseTabCounterIncognito("Tabs geöffnet: 2", labels))
+    }
+
+    @Test
     fun `processExtractedText filters blank text`() {
         assertNull(processExtractedText(""))
         assertNull(processExtractedText("   "))

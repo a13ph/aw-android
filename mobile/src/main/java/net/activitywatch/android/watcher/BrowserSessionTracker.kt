@@ -8,7 +8,8 @@ internal data class CompletedBrowserSession(
     val browser: String,
     val title: String,
     val start: Instant,
-    val duration: Duration
+    val duration: Duration,
+    val incognito: Boolean = false
 )
 
 // Pure session/state-machine logic extracted out of WebWatcher so it can be unit-tested
@@ -20,13 +21,17 @@ internal class BrowserSessionTracker(
     private var lastUrl: String? = null
     private var lastBrowser: String? = null
     private var lastWindowTitle: String? = null
+    private var lastIncognito = false
 
-    // Returns the just-completed session (previous url/browser/title) when the url or
-    // browser changes, so the caller can log it. We wait for the url to change before
-    // logging so we have a chance to receive the page title, which often only arrives
-    // after the page loads and/or the user interacts with it.
-    fun handleUrl(newUrl: String?, newBrowser: String?): CompletedBrowserSession? {
-        if (newUrl == lastUrl && newBrowser == lastBrowser) return null
+    // Returns the just-completed session (previous url/browser/title) when the url,
+    // browser or private mode changes, so the caller can log it. We wait for the url to
+    // change before logging so we have a chance to receive the page title, which often
+    // only arrives after the page loads and/or the user interacts with it.
+    // `incognito` null means the lookup could not tell: the mode last seen in the same
+    // browser is kept, since the mode does not change without the browser in front.
+    fun handleUrl(newUrl: String?, newBrowser: String?, incognito: Boolean? = null): CompletedBrowserSession? {
+        val newIncognito = incognito ?: (lastIncognito && newBrowser == lastBrowser)
+        if (newUrl == lastUrl && newBrowser == lastBrowser && newIncognito == lastIncognito) return null
 
         val completed = lastUrl?.let { url ->
             lastBrowser?.let { browser ->
@@ -38,7 +43,8 @@ internal class BrowserSessionTracker(
                     start = start,
                     // Clock can step backward (NTP sync, manual change) between `start` and now;
                     // don't report a negative duration in that case.
-                    duration = Duration.between(start, now()).coerceAtLeast(Duration.ZERO)
+                    duration = Duration.between(start, now()).coerceAtLeast(Duration.ZERO),
+                    incognito = lastIncognito
                 )
             }
         }
@@ -47,6 +53,7 @@ internal class BrowserSessionTracker(
         lastUrl = newUrl
         lastBrowser = newBrowser
         lastWindowTitle = null
+        lastIncognito = newIncognito
         return completed
     }
 

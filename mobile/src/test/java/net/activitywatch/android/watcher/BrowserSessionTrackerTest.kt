@@ -127,4 +127,53 @@ class BrowserSessionTrackerTest {
         checkNotNull(completed)
         assertEquals(0L, completed.duration.seconds)
     }
+
+    @Test
+    fun `the completed session carries the private mode it was seen in`() {
+        val tracker = BrowserSessionTracker()
+
+        tracker.handleUrl("example.com", "firefox", incognito = true)
+        val completed = tracker.handleUrl("example.org", "firefox", incognito = false)
+
+        checkNotNull(completed)
+        assertEquals(true, completed.incognito)
+    }
+
+    @Test
+    fun `a change of private mode alone (same url) ends the session`() {
+        val tracker = BrowserSessionTracker()
+
+        tracker.handleUrl("example.com", "firefox", incognito = false)
+        val completed = tracker.handleUrl("example.com", "firefox", incognito = true)
+
+        checkNotNull(completed)
+        assertEquals(false, completed.incognito)
+    }
+
+    @Test
+    fun `an unknown mode keeps the mode last seen in the same browser`() {
+        val tracker = BrowserSessionTracker()
+
+        tracker.handleUrl("example.com", "firefox", incognito = true)
+        assertNull(tracker.handleUrl("example.com", "firefox", incognito = null))
+        val completed = tracker.handleUrl("example.org", "firefox", incognito = null)
+
+        checkNotNull(completed)
+        assertEquals(true, completed.incognito)
+        val next = tracker.handleUrl(null, null)
+        checkNotNull(next)
+        assertEquals(true, next.incognito)
+    }
+
+    @Test
+    fun `an unknown mode in another browser is not private`() {
+        val tracker = BrowserSessionTracker()
+
+        tracker.handleUrl("example.com", "firefox", incognito = true)
+        tracker.handleUrl("example.com", "chrome")
+        val completed = tracker.handleUrl("example.org", "chrome")
+
+        checkNotNull(completed)
+        assertEquals(false, completed.incognito)
+    }
 }

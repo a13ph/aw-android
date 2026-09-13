@@ -39,17 +39,57 @@ class WebWatcher : AccessibilityService() {
     // findAccessibilityNodeInfosByViewId requires "package:id/name" format and silently
     // rejects bare testTag names, so we traverse manually - breadth-first and capped (see
     // findNode), because the toolbar is shallow and the page below it can be huge.
-    private fun extractFirefoxUrl(): String? {
+    // The tab counter sits in the same toolbar and names the browsing mode (see
+    // parseTabCounterIncognito); its search runs only once a URL was found.
+    private fun extractFirefox(browser: String): FirefoxState? {
         val root = rootInActiveWindow ?: return null
         try {
-            val found = findNode(root) { it.viewIdResourceName == "ADDRESSBAR_URL_BOX" }
-            val result = parseFirefoxAddressBarContentDescription(found?.contentDescription?.toString())
-            if (found !== root) found?.recycle()
-            return result
+            val urlBox = findNode(root) { it.viewIdResourceName == "ADDRESSBAR_URL_BOX" }
+            val url = parseFirefoxAddressBarContentDescription(urlBox?.contentDescription?.toString())
+            if (urlBox !== root) urlBox?.recycle()
+            if (url == null) return null
+            val labels = tabCounterLabels(browser)
+            val counter = findNode(root) {
+                parseTabCounterIncognito(it.contentDescription?.toString(), labels) != null
+            }
+            val counterText = counter?.contentDescription?.toString()
+            if (counter !== root) counter?.recycle()
+            if (counterText != lastTabCounter) {
+                Log.i(TAG, "Tab counter: $counterText")
+                lastTabCounter = counterText
+            }
+            return FirefoxState(url, parseTabCounterIncognito(counterText, labels))
         } finally {
             root.recycle()
         }
     }
+
+    private class FirefoxState(val url: String, val incognito: Boolean?)
+
+    // Worker thread only.
+    private var lastTabCounter: String? = null
+    private val tabCounterLabelsByBrowser = mutableMapOf<String, TabCounterLabels>()
+
+    // The browser's own tab counter strings in the phone's language, plus the English ones.
+    private fun tabCounterLabels(browser: String): TabCounterLabels =
+        tabCounterLabelsByBrowser.getOrPut(browser) {
+            val own = try {
+                val res = packageManager.getResourcesForApplication(browser)
+                fun prefix(name: String): String? =
+                    res.getIdentifier(name, "string", browser).takeIf { it != 0 }
+                        ?.let { tabCounterLabelPrefix(res.getString(it)) }
+                TabCounterLabels(
+                    listOfNotNull(prefix("mozac_tab_counter_private")),
+                    listOfNotNull(prefix("mozac_tab_counter_open_tab_tray"), prefix("mozac_open_tab_counter_tab_tray"))
+                )
+            } catch (ex: Exception) {
+                Log.w(TAG, "No tab counter strings from $browser: ${ex.message}")
+                null
+            }
+            val labels = own?.let { it + ENGLISH_TAB_COUNTER_LABELS } ?: ENGLISH_TAB_COUNTER_LABELS
+            Log.i(TAG, "Tab counter labels for $browser: $labels")
+            labels
+        }
 
     private val TAG = "WebWatcher"
     private val bucket_id = "aw-watcher-android-web"
@@ -81,10 +121,8 @@ class WebWatcher : AccessibilityService() {
     private fun extractUrl(packageName: String, event: AccessibilityEvent): String? = when (packageName) {
         "com.android.chrome" -> extractTextByViewId(event, "com.android.chrome:id/url_bar")
         "org.mozilla.firefox", "org.mozilla.fennec_fdroid" ->
-            // Compose toolbar (current)
-            extractFirefoxUrl()
-                // View-based toolbar (older Firefox versions)
-                ?: extractTextByViewId(event, "org.mozilla.firefox:id/url_bar_title")
+            // View-based toolbar (older Firefox versions); the Compose toolbar is extractFirefox
+            extractTextByViewId(event, "org.mozilla.firefox:id/url_bar_title")
                 ?: extractTextByViewId(event, "org.mozilla.firefox:id/mozac_browser_toolbar_url_view")
         "com.sec.android.app.sbrowser" ->
             extractTextByViewId(event, "com.sec.android.app.sbrowser:id/location_bar_edit_text")
@@ -188,12 +226,16 @@ class WebWatcher : AccessibilityService() {
         }
 
         val browser = packageName!!
-        val newUrl = extractUrl(browser, event)
+        val firefox = if (browser in FIREFOX_PACKAGES) extractFirefox(browser) else null
+        val newUrl = firefox?.url?.let(stripProtocol) ?: extractUrl(browser, event)
 
         if (newUrl == null) {
-            maybeDumpTree(browser)
+            maybeDumpTree(browser, "URL extraction failed")
         } else {
-            handleUrl(newUrl, newBrowser = browser)
+            if (browser in FIREFOX_PACKAGES && firefox?.incognito == null) {
+                maybeDumpTree(browser, "No tab counter found")
+            }
+            handleUrl(newUrl, newBrowser = browser, incognito = firefox?.incognito)
         }
         if (browser in FIREFOX_PACKAGES) {
             // Firefox's page content is not a descendant of the event source (see
@@ -234,16 +276,16 @@ class WebWatcher : AccessibilityService() {
         findNode(info) { it.className == "android.webkit.WebView" && it.text != null }
 
     // Dumps the accessibility tree to logcat at debug level, rate-limited to once per minute
-    // per browser. Helps diagnose URL extraction failures when adding support for new browsers
-    // or browser versions that have changed their view hierarchy. Enable with:
+    // per browser. Helps diagnose URL or tab counter extraction failures when adding support
+    // for new browsers or browser versions that have changed their view hierarchy. Enable with:
     //   adb shell setprop log.tag.WebWatcher DEBUG
-    private fun maybeDumpTree(packageName: String) {
+    private fun maybeDumpTree(packageName: String, why: String) {
         if (!Log.isLoggable(TAG, Log.DEBUG)) return
         val now = System.currentTimeMillis()
         if (now - (lastDiagnosticDump[packageName] ?: 0L) < 60_000L) return
         lastDiagnosticDump[packageName] = now
         val root = rootInActiveWindow ?: return
-        Log.d(TAG, "URL extraction failed for $packageName — accessibility tree:")
+        Log.d(TAG, "$why for $packageName — accessibility tree:")
         try {
             forEachNode(root) { node, depth ->
                 val id = node.viewIdResourceName ?: ""
@@ -258,9 +300,9 @@ class WebWatcher : AccessibilityService() {
         }
     }
 
-    private fun handleUrl(newUrl : String?, newBrowser: String?) {
-        newUrl?.let { Log.i(TAG, "Url: $it, browser: $newBrowser") }
-        sessionTracker.handleUrl(newUrl, newBrowser)?.let { logBrowserEvent(it) }
+    private fun handleUrl(newUrl : String?, newBrowser: String?, incognito: Boolean? = null) {
+        newUrl?.let { Log.i(TAG, "Url: $it, browser: $newBrowser, incognito: $incognito") }
+        sessionTracker.handleUrl(newUrl, newBrowser, incognito)?.let { logBrowserEvent(it) }
     }
 
     private fun handleWindowTitle(newWindowTitle: String) {
@@ -275,7 +317,7 @@ class WebWatcher : AccessibilityService() {
             .put("browser", session.browser)
             .put("title", session.title)
             .put("audible", false) // TODO
-            .put("incognito", false) // TODO
+            .put("incognito", session.incognito)
 
         Log.i(TAG, "Registered event: $data")
         ri?.heartbeatHelper(bucket_id, session.start, session.duration.seconds.toDouble(), data, 1.0)
