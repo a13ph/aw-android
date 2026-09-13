@@ -8,6 +8,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.inputmethod.InputMethodManager
 import java.util.concurrent.atomic.AtomicReference
 import net.activitywatch.android.RustInterface
 import org.json.JSONObject
@@ -30,6 +31,7 @@ private fun extractTextByViewId(event: AccessibilityEvent, viewId: String): Stri
 // a window change is looked up at once.
 private const val SAME_WINDOW_INTERVAL_MS = 2_000L
 private const val STATS_EVERY_MS = 60_000L
+private const val INPUT_METHODS_EVERY_MS = 600_000L
 
 private val FIREFOX_PACKAGES = setOf("org.mozilla.firefox", "org.mozilla.fennec_fdroid")
 
@@ -110,6 +112,11 @@ class WebWatcher : AccessibilityService() {
     @Volatile private var lastLookupAt = 0L
     private val lookup = Runnable { lookUpPending() }
 
+    // Enabled keyboards' packages (see isInputMethodEvent). Read on the worker thread, since
+    // the list is a binder call; the main thread only checks membership.
+    @Volatile private var inputMethodPackages: Set<String> = emptySet()
+    private var inputMethodsReadAt = 0L
+
     // Written on the worker thread only.
     private var statsSince = 0L
     private var statsLookups = 0
@@ -147,6 +154,19 @@ class WebWatcher : AccessibilityService() {
                 // UnsatisfiedLinkError (an Error subclass) when the native library is missing.
                 Log.e(TAG, "Failed to initialize RustInterface: ${ex.message}")
             }
+            readInputMethods()
+        }
+    }
+
+    // Worker thread.
+    private fun readInputMethods() {
+        inputMethodsReadAt = SystemClock.uptimeMillis()
+        try {
+            val ids = getSystemService(InputMethodManager::class.java)?.enabledInputMethodList?.map { it.id }
+            inputMethodPackages = inputMethodPackagesOf(ids.orEmpty())
+            Log.i(TAG, "Input methods: $inputMethodPackages")
+        } catch (ex: Exception) {
+            Log.w(TAG, "Could not list input methods: ${ex.message}")
         }
     }
 
@@ -180,6 +200,8 @@ class WebWatcher : AccessibilityService() {
         val event = pending.getAndSet(null) ?: return
         val started = SystemClock.uptimeMillis()
         lastLookupAt = started
+        // A keyboard installed or enabled since the last read is picked up within this long.
+        if (started - inputMethodsReadAt >= INPUT_METHODS_EVERY_MS) readInputMethods()
         try {
             handleEvent(event)
         } catch (ex: Exception) {
@@ -256,8 +278,11 @@ class WebWatcher : AccessibilityService() {
 
     private fun windowChanged(windowId: Int): Boolean = windowId != lastWindowId
 
+    // Dropped before they reach the worker, so they neither end a visit nor count as the
+    // window in front for the throttle.
     private fun shouldIgnoreEvent(event: AccessibilityEvent) =
-        event.packageName == "com.android.systemui"
+        event.packageName == "com.android.systemui" ||
+            isInputMethodEvent(event.packageName, inputMethodPackages)
 
     // TODO(maintainer): this never finds a match for Firefox, so its page title is never
     // captured (logged events show title:""). Confirmed live on-device (2026-07-01, Fenix,
