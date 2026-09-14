@@ -238,7 +238,10 @@ class ProbookSync private constructor(private val context: Context) {
             if (complete || acked.getJSONArray(pid).optLong(1) > oldest) deletes.add(pid.toLong())
         }
 
-        if (upserts.isNotEmpty() || deletes.isNotEmpty()) {
+        // A bucket with no events yet is still sent once, so probook has it before
+        // the first event: the waybar pills and the timeline list buckets, not events.
+        val announce = !state.optBoolean("announced")
+        if (upserts.isNotEmpty() || deletes.isNotEmpty() || announce) {
             val bucket = JSONObject().put("id", id).put("client", meta.optString("client"))
                 .put("type", meta.optString("type")).put("hostname", meta.optString("hostname"))
             upserts.sortBy { OffsetDateTime.parse(it.getString("timestamp")).toInstant() }
@@ -257,6 +260,8 @@ class ProbookSync private constructor(private val context: Context) {
                 state.put("acked", acked)
                 save(stateFile, state)
             }
+            state.put("announced", true)
+            save(stateFile, state)
         }
         if (full) {
             state.put("acked", acked).put("full", now())
