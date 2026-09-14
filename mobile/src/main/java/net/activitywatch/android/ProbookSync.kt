@@ -39,6 +39,13 @@ private const val TAG = "ProbookSync"
  * disappeared, and records only what probook answered for. So a run that fails half-way,
  * or a probook that is off, loses nothing: the next run sends the rest.
  *
+ * The same run then pulls probook's own spans and points ([PULL_BUCKETS], through
+ * break-relay's `/pull`) into buckets of the same name here, as a mirror: an event is
+ * upserted by its probook id and one that probook no longer has is deleted, within the
+ * pulled window (the last [PULL_WINDOW_S], or [PULL_FIRST_DAYS] on the first pull).
+ * Those `*_probook-nix` buckets are never pushed back. The mirror is written through
+ * this phone's own HTTP API, the only one that deletes and replaces by id.
+ *
  * Runs every 2 min while the screen is on, on every screen-on, from an idle-allowed
  * alarm every 10 min, and when a [ACTION_KICK] broadcast arrives (the break buttons send
  * one after a tap). Does nothing until `files/probook-sync.json` holds `{"url", "key"}`.
@@ -57,6 +64,13 @@ class ProbookSync private constructor(private val context: Context) {
         private const val READ_MS = 60000
         private const val LOG_MAX = 300_000L
         private val ACKED = setOf("same", "new", "updated", "adopted", "adopted-updated")
+        private const val PULLED_SUFFIX = "_probook-nix"
+        private val PULL_BUCKETS = listOf(
+            "break", "activity", "sleep", "food", "drink", "meds", "symptom", "desk"
+        ).map { "aw-watcher-$it$PULLED_SUFFIX" }
+        private const val PULL_WINDOW_S = 2 * 86400L
+        private const val PULL_FIRST_DAYS = 31L
+        private const val LOCAL_API = "http://127.0.0.1:5600/api/0"
 
         private var instance: ProbookSync? = null
 
@@ -140,8 +154,18 @@ class ProbookSync private constructor(private val context: Context) {
             val started = SystemClock.elapsedRealtime()
             val cfg = readConfig()
             if (cfg != null) {
-                val sent = syncAll(cfg)
-                status("ok sent=$sent ms=${SystemClock.elapsedRealtime() - started}")
+                // A refused push bucket must not stop the pull; the run still reports it.
+                var pushFailure: IOException? = null
+                val sent = try {
+                    syncAll(cfg)
+                } catch (e: IOException) {
+                    pushFailure = e
+                    0
+                }
+                val pulled = pullAll(cfg)
+                if (pushFailure != null) throw pushFailure
+                status("ok sent=$sent pulled=$pulled ms=${SystemClock.elapsedRealtime() - started}")
+                if (pulled > 0) log("pulled", "$pulled change(s)")
                 if (lastFailure != null) log("recovered", "after: $lastFailure")
                 lastFailure = null
                 if (sent > 0) log("sent", "$sent event(s)")
@@ -176,6 +200,8 @@ class ProbookSync private constructor(private val context: Context) {
         for (id in buckets.keys()) {
             // Throwaway buckets from proof scripts stay on the phone.
             if (id.contains("-test")) continue
+            // probook's own buckets, mirrored here by pullAll: probook is their first copy.
+            if (id.endsWith(PULLED_SUFFIX)) continue
             // One bucket failing (probook unreachable, a readback refused) must not
             // keep the buckets after it from syncing; the run still reports it.
             try {
@@ -268,6 +294,109 @@ class ProbookSync private constructor(private val context: Context) {
             save(stateFile, state)
         }
         return upserts.size + deletes.size
+    }
+
+    /**
+     * Mirrors probook's [PULL_BUCKETS] into this phone's buckets of the same name.
+     * State in `files/probook-sync/pull.json`: per bucket, probook id -> [phone id,
+     * fingerprint, end ms]. Returns how many phone events it wrote or deleted.
+     */
+    private fun pullAll(cfg: Config): Int {
+        val stateFile = File(stateDir, "pull.json")
+        val state = try {
+            JSONObject(stateFile.readText())
+        } catch (e: Exception) {
+            JSONObject()
+        }
+        val maps = state.optJSONObject("maps") ?: JSONObject()
+        val back = if (state.optBoolean("pulled")) PULL_WINDOW_S else PULL_FIRST_DAYS * 86400
+        val body = JSONObject().put("buckets", JSONArray(PULL_BUCKETS))
+            .put("since", isoFormat.format(Date((now() - back) * 1000)))
+        val reply = JSONObject(request(cfg.url.replace(Regex("/sync$"), "/pull"), "POST", cfg.key, body.toString()))
+        // The relay may have moved since (it caps how far back a pull reaches).
+        val sinceMs = OffsetDateTime.parse(reply.getString("since")).toInstant().toEpochMilli()
+        val localKey = ensureDashboardApiKey(context)
+        val buckets = reply.getJSONObject("buckets")
+        var changed = 0
+        for (bid in buckets.keys()) {
+            val got = buckets.getJSONObject(bid)
+            val meta = got.getJSONObject("meta")
+            request(
+                "$LOCAL_API/buckets/$bid", "POST", localKey,
+                JSONObject().put("client", meta.optString("client")).put("type", meta.optString("type"))
+                    .put("hostname", meta.optString("hostname")).toString(),
+                okCodes = setOf(304)
+            )
+            val map = maps.optJSONObject(bid) ?: JSONObject()
+            val seen = HashSet<String>()
+            val writes = ArrayList<Triple<String, JSONObject, String>>()
+            val events = got.getJSONArray("events")
+            for (i in 0 until events.length()) {
+                val e = events.getJSONObject(i)
+                val pb = e.getLong("id").toString()
+                seen.add(pb)
+                val ts = e.getString("timestamp")
+                val duration = e.optDouble("duration", 0.0)
+                val data = e.optJSONObject("data") ?: JSONObject()
+                val fp = sha1("$ts|$duration|$data")
+                val had = map.optJSONArray(pb)
+                if (had != null && had.optString(1) == fp) continue
+                val ev = JSONObject().put("timestamp", ts).put("duration", duration).put("data", data)
+                if (had != null) ev.put("id", had.getLong(0))
+                writes.add(Triple(pb, ev, fp))
+            }
+            for (chunk in writes.chunked(BATCH)) {
+                val stored = JSONArray(
+                    request("$LOCAL_API/buckets/$bid/events", "POST", localKey, JSONArray(chunk.map { it.second }).toString())
+                )
+                if (stored.length() != chunk.size) throw IOException("$bid: stored ${stored.length()} of ${chunk.size}")
+                for ((i, w) in chunk.withIndex()) {
+                    val s = stored.getJSONObject(i)
+                    val sent = OffsetDateTime.parse(w.second.getString("timestamp")).toInstant()
+                    val start = OffsetDateTime.parse(s.getString("timestamp")).toInstant()
+                    if (start != sent) throw IOException("$bid: answer out of order at $i")
+                    val end = start.toEpochMilli() + (w.second.getDouble("duration") * 1000).toLong()
+                    map.put(w.first, JSONArray().put(s.getLong("id")).put(w.third).put(end))
+                }
+                changed += chunk.size
+                maps.put(bid, map)
+                save(stateFile, state.put("maps", maps))
+            }
+            // Gone from probook: only an event ending inside the pulled window can tell.
+            val gone = map.keys().asSequence().filter { it !in seen && map.getJSONArray(it).optLong(2) >= sinceMs }.toList()
+            for (pb in gone) {
+                request("$LOCAL_API/buckets/$bid/events/${map.getJSONArray(pb).getLong(0)}", "DELETE", localKey, null, okCodes = setOf(404))
+                map.remove(pb)
+                changed++
+            }
+            maps.put(bid, map)
+            save(stateFile, state.put("maps", maps))
+        }
+        save(stateFile, state.put("maps", maps).put("pulled", true))
+        return changed
+    }
+
+    /** The answer body of a 2xx (or of a code in [okCodes]); anything else throws. */
+    private fun request(url: String, method: String, key: String, body: String?, okCodes: Set<Int> = emptySet()): String {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        try {
+            conn.connectTimeout = CONNECT_MS
+            conn.readTimeout = READ_MS
+            conn.requestMethod = method
+            if (key.isNotEmpty()) conn.setRequestProperty("Authorization", "Bearer $key")
+            if (body != null) {
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.outputStream.use { it.write(body.toByteArray()) }
+            }
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            if (code !in 200..299 && code !in okCodes) throw IOException("HTTP $code for $method $url: ${text.take(200)}")
+            return text
+        } finally {
+            conn.disconnect()
+        }
     }
 
     /** The reply, or null when probook refused this bucket (other buckets still go). */
