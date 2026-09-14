@@ -338,9 +338,9 @@ class WebWatcher : AccessibilityService() {
 
     private fun logBrowserEvent(session: CompletedBrowserSession) {
         val data = JSONObject()
-            .put("url", session.url)
+            .put("url", if (session.incognito) "" else session.url)
             .put("browser", session.browser)
-            .put("title", session.title)
+            .put("title", if (session.incognito) "private" else session.title)
             .put("audible", false) // TODO
             .put("incognito", session.incognito)
 
