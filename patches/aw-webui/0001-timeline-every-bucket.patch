@@ -1,0 +1,181 @@
+From 7c9e9de660bf9d2a7c464afdb916ac4ae1087c07 Mon Sep 17 00:00:00 2001
+From: a13ph <bestiarium@gmail.com>
+Date: Mon, 14 Sep 2026 11:07:26 +0000
+Subject: [PATCH] feat(timeline): show every bucket, keep short events visible,
+ per-bucket hide list
+
+---
+ src/views/Timeline.vue             | 46 ++++++++++++++++++++++++++++++
+ src/visualizations/VisTimeline.vue | 27 +++++++++---------
+ 2 files changed, 59 insertions(+), 14 deletions(-)
+
+diff --git a/src/views/Timeline.vue b/src/views/Timeline.vue
+index 06cb4a8..d201ddd 100644
+--- a/src/views/Timeline.vue
++++ b/src/views/Timeline.vue
+@@ -67,6 +67,14 @@ div
+                 span.badge.badge-info.mr-1(v-for="(cat, idx) in filter_categories", :key="idx")
+                   | {{ cat.join(' > ') }}
+                   button.ml-1.close.small(@click="removeCategory(idx)", type="button", aria-label="Remove category", style="font-size: 0.85rem; line-height: 1") &times;
++          tr
++            th.pt-2.pr-3.align-top
++              label Buckets:
++            td
++              div.timeline-bucket-list
++                b-form-checkbox(v-for="bucket in all_buckets || []", :key="bucket.id", size="sm", :checked="!hidden_buckets.includes(bucket.id)", @change="setBucketHidden(bucket.id, !$event)")
++                  | {{ bucket.id }}
++              button.btn.btn-sm.btn-link.p-0(v-if="hidden_buckets.length > 0", type="button", @click="hidden_buckets = []") Show all
+ 
+     // Display options (swimlanes, future visual toggles) tucked behind a
+     // ghost kebab so they don't compete visually with Filters.
+@@ -121,6 +129,17 @@ import { matchString } from '~/util/classes';
+ import { getCategorizationStringFromEvent } from '~/util/color';
+ import { seconds_to_duration } from '~/util/time';
+ 
++const HIDDEN_BUCKETS_KEY = 'aw.timeline.hiddenBuckets';
++
++function loadHiddenBuckets(): string[] {
++  try {
++    const stored = JSON.parse(localStorage.getItem(HIDDEN_BUCKETS_KEY) || '[]');
++    return Array.isArray(stored) ? stored : [];
++  } catch (e) {
++    return [];
++  }
++}
++
+ export default {
+   name: 'Timeline',
+   data() {
+@@ -137,6 +156,7 @@ export default {
+       filter_afk: false,
+       filter_merge_similar: false,
+       filter_categories: [],
++      hidden_buckets: loadHiddenBuckets(),
+       swimlane: null,
+       swimlaneOptions: [
+         { value: null, text: 'None' },
+@@ -185,6 +205,10 @@ export default {
+         );
+       }
+ 
++      if (this.hidden_buckets.length > 0) {
++        desc.push(this.hidden_buckets.length + ' hidden');
++      }
++
+       if (desc.length > 0) {
+         return desc.join(', ');
+       }
+@@ -224,8 +248,21 @@ export default {
+       this.updateTimelineWindow = false;
+       this.getBuckets();
+     },
++    hidden_buckets() {
++      try {
++        localStorage.setItem(HIDDEN_BUCKETS_KEY, JSON.stringify(this.hidden_buckets));
++      } catch (e) {
++        /* localStorage disabled: the list lasts until reload */
++      }
++      this.updateTimelineWindow = false;
++      this.getBuckets();
++    },
+   },
+   methods: {
++    setBucketHidden(bucketId, hidden) {
++      const rest = this.hidden_buckets.filter(id => id !== bucketId);
++      this.hidden_buckets = hidden ? [...rest, bucketId] : rest;
++    },
+     onCategorySelect(event) {
+       const text = event.target.value;
+       if (!text) return;
+@@ -262,6 +299,9 @@ export default {
+       if (this.filter_client) {
+         buckets = _.filter(buckets, b => b.client == this.filter_client);
+       }
++      if (this.hidden_buckets.length > 0) {
++        buckets = _.filter(buckets, b => !this.hidden_buckets.includes(b.id));
++      }
+ 
+       if (this.filter_duration > 0) {
+         for (const bucket of buckets) {
+@@ -457,4 +497,10 @@ export default {
+ .timeline-filters[open] .timeline-filters-panel {
+   display: block;
+ }
++
++.timeline-bucket-list {
++  max-height: 40vh;
++  overflow-y: auto;
++  white-space: nowrap;
++}
+ </style>
+diff --git a/src/visualizations/VisTimeline.vue b/src/visualizations/VisTimeline.vue
+index 90501f7..8920d6d 100644
+--- a/src/visualizations/VisTimeline.vue
++++ b/src/visualizations/VisTimeline.vue
+@@ -2,9 +2,6 @@
+   div
+     div#visualization
+ 
+-    div.small.text-muted.my-2(v-if="bucketsFromEither.length != 1")
+-      i Buckets with no events in the queried range will be hidden.
+-
+     div(v-if="editingEvent")
+       EventEditor(:event="editingEvent" :bucket_id="editingEventBucket")
+ </template>
+@@ -19,6 +16,11 @@ div#visualization {
+     overflow: visible;
+   }
+ 
++  // Short and zero-length events keep a visible width.
++  .vis-item.vis-range {
++    min-width: 3px;
++  }
++
+   .vis-tooltip {
+     // Position tooltip above the cursor instead of overlapping the timeline bars
+     transform: translateY(-100%);
+@@ -95,7 +97,7 @@ export default {
+   data() {
+     return {
+       timeline: null,
+-      filterShortEvents: true,
++      filterShortEvents: false,
+       items: [],
+       groups: [],
+       options: {
+@@ -385,7 +387,7 @@ export default {
+         };
+       });
+ 
+-      if (groups.length > 0 && items.length > 0) {
++      if (groups.length > 0) {
+         if (this.queriedInterval && this.showQueriedInterval) {
+           const duration = this.queriedInterval[1].diff(this.queriedInterval[0], 'seconds');
+           groups.push({ id: String(groups.length), content: 'queried interval' });
+@@ -415,17 +417,14 @@ export default {
+           const end =
+             (this.queriedInterval && this.queriedInterval[1]) ||
+             _.max(_.map(items, item => item.end));
+-          this.options.min = start;
+-          this.options.max = end;
+-          this.timeline.setOptions(this.options);
+-          this.timeline.setWindow(start, end);
++          if (start && end) {
++            this.options.min = start;
++            this.options.max = end;
++            this.timeline.setOptions(this.options);
++            this.timeline.setWindow(start, end);
++          }
+         }
+ 
+-        // Hide buckets with no events in the queried range
+-        const count = _.countBy(items, i => i.group);
+-        groups = _.filter(groups, g => {
+-          return count[g.id] && count[g.id] > 0;
+-        });
+         this.timeline.setData({ groups: groups, items: items });
+ 
+         this.items = items;
+-- 
+2.43.0
+

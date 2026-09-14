@@ -204,7 +204,8 @@ $(RS_SRCDIR)/target/%/$(RELEASE_TYPE)/libaw_server.so: $(RS_SOURCES) $(WEBUI_DIS
 		echo "Using prebuilt libaw_server.so"; \
 	else \
 		echo "Building libaw_server.so from aw-server-rust repo"; \
-		env RUSTFLAGS=$(RUSTFLAGS_ANDROID) make -C aw-server-rust android; \
+		mkdir -p $(WEBUI_DISTDIR); \
+		env RUSTFLAGS=$(RUSTFLAGS_ANDROID) AW_WEBUI_DIR=$$(pwd)/$(WEBUI_DISTDIR) make -C aw-server-rust android; \
 	fi
 
 # Same rule for libaw_sync.so (but without webui dependency)
@@ -227,6 +228,10 @@ $(WEBUI_DISTDIR):
 		echo "Skipping aw-webui build, as SKIP_WEBUI is set"; \
 	else \
 		echo "Building aw-webui"; \
+		for p in $$(pwd)/patches/aw-webui/*.patch; do \
+			git -C aw-server-rust/aw-webui apply --reverse --check "$$p" 2>/dev/null \
+				|| git -C aw-server-rust/aw-webui apply "$$p" || exit 1; \
+		done; \
 		make --directory=aw-server-rust/aw-webui build; \
 	fi
 

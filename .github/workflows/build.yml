@@ -37,7 +37,7 @@ jobs:
         cache-name: jniLibs
       with:
         path: mobile/src/main/jniLibs/
-        key: ${{ env.cache-name }}-release-${{ env.RELEASE }}-ndk-${{ env.NDK_VERSION }}-${{ hashFiles('.git/modules/aw-server-rust/HEAD') }}
+        key: ${{ env.cache-name }}-release-${{ env.RELEASE }}-ndk-${{ env.NDK_VERSION }}-${{ hashFiles('.git/modules/aw-server-rust/HEAD') }}-${{ hashFiles('patches/aw-webui/**') }}
 
     - name: Display structure of downloaded files
       if: steps.cache-jniLibs.outputs.cache-hit == 'true'
@@ -171,7 +171,7 @@ jobs:
         cache-name: jniLibs
       with:
         path: mobile/src/main/jniLibs/
-        key: ${{ env.cache-name }}-release-${{ env.RELEASE }}-ndk-${{ env.NDK_VERSION }}-${{ hashFiles('.git/modules/aw-server-rust/HEAD') }}
+        key: ${{ env.cache-name }}-release-${{ env.RELEASE }}-ndk-${{ env.NDK_VERSION }}-${{ hashFiles('.git/modules/aw-server-rust/HEAD') }}-${{ hashFiles('patches/aw-webui/**') }}
         fail-on-cache-miss: false
 
     - name: Check that jniLibs present and valid ELF
