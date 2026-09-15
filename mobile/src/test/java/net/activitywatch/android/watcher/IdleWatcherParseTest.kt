@@ -21,6 +21,17 @@ class IdleWatcherParseTest {
     }
 
     @Test
+    fun android15LowercaseLineIsReadToo() {
+        val dump = sequenceOf(
+            "  mWakefulness=Awake",
+            "  mLastUserActivityTime(excludingAttention)=1486351",
+            "    lastUserActivityTime=1486351 (10912 ms ago)",
+            "    lastUserActivityTimeNoChangeLights=311246 (1186017 ms ago)",
+        )
+        assertEquals(PowerSample(10912L, "Awake"), parsePowerDump(dump))
+    }
+
+    @Test
     fun asleepIsReadToo() {
         val dump = sequenceOf("  mLastUserActivityTime=5 (0 ms ago)", "  mWakefulness=Asleep")
         assertEquals(PowerSample(0L, "Asleep"), parsePowerDump(dump))

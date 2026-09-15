@@ -32,7 +32,7 @@ private const val TAG = "aw-idle"
 /** What `dumpsys power` says: ms since the last user activity (touch, key), and wakefulness. */
 internal data class PowerSample(val lastActivityAgoMs: Long?, val wakefulness: String?)
 
-private val AGO_RE = Regex("""^\s*mLastUserActivityTime=\d+ \((\d+) ms ago\)""")
+private val AGO_RE = Regex("""^\s*m?[lL]astUserActivityTime=\d+ \((\d+) ms ago\)""")
 private val WAKE_RE = Regex("""^\s*mWakefulness=([A-Za-z]+)""")
 
 /** Reads the two fields from `dumpsys power` output, stopping as soon as both are seen. */
@@ -340,7 +340,7 @@ class IdleWatcher private constructor(private val context: Context) {
         val sample = samplePower()
         val ago = sample.lastActivityAgoMs
         if (ago == null) {
-            if (dumpOk != false) life("no-dump", "dumpsys power gave no mLastUserActivityTime")
+            if (dumpOk != false) life("no-dump", "dumpsys power gave no (m)LastUserActivityTime")
             dumpOk = false
             return INTERVAL_S
         }
