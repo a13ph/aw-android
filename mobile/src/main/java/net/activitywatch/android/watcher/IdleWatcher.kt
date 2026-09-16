@@ -193,6 +193,8 @@ class IdleWatcher private constructor(private val context: Context) {
     private val killsSince = File(dir, "aw-idle-capture.since")
     private val dropboxDir = File(dir, "dropbox")
     private val dropboxSince = File(dir, "aw-idle-dropbox.since")
+    private val sentLog = File(dir, "cc-sent.log")
+    private var sentPos = 0L
     private val ccFlag = File(dir, "cc-driving")
     private val ccWho = File(dir, "cc-driving.who")
     private val ccLedger = File(dir, "cc-driving.log")
@@ -348,6 +350,7 @@ class IdleWatcher private constructor(private val context: Context) {
         dumpOk = true
         val wake = sample.wakefulness ?: ""
         val touch = now - ago / 1000
+        readSentLog()
         while ((injections.peekFirst() ?: now) < now - 600) injections.pollFirst()
         val by = classifyTouch(touch, ccS, ccE, injections, shellThread?.isAlive == true, INJECT_S)
         if (by == null) alTouch = touch
@@ -381,6 +384,37 @@ class IdleWatcher private constructor(private val context: Context) {
         beat(now, newState)
         state = newState
         return INTERVAL_S
+    }
+
+    // New lines of cc-sent.log since the last tick: the step script appends
+    // `<epoch> <session> <agent> <kind> <cmd>` before each command it sends. A tap,
+    // key or `input`/`monkey` run there is an injection even when logcat shows nothing,
+    // which on Android 15 is every `input` call (`/system/bin/input` = `cmd input`).
+    private fun readSentLog() {
+        if (!sentLog.exists()) return
+        val len = sentLog.length()
+        if (len < sentPos) sentPos = 0
+        if (len == sentPos) return
+        try {
+            RandomAccessFile(sentLog, "r").use { f ->
+                f.seek(sentPos)
+                val buf = ByteArray((len - sentPos).toInt())
+                f.readFully(buf)
+                sentPos = len
+                for (line in String(buf).lines()) {
+                    val p = line.trim().split(Regex("\\s+"), limit = 5)
+                    if (p.size < 5) continue
+                    val epoch = p[0].toLongOrNull() ?: continue
+                    val kind = p[3]
+                    val cmd = p[4]
+                    if (kind == "tap" || kind == "key" || (kind == "run" && INJECTORS.any { cmd.startsWith(it) })) {
+                        if (injections.peekLast() != epoch) injections.addLast(epoch)
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            life("error", "sent log: $t")
+        }
     }
 
     // Follows logcat for what the adb shell (uid 2000) runs: java commands such as
