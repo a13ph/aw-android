@@ -124,8 +124,10 @@ class ProbookSync private constructor(private val context: Context) {
         handler.post {
             stateDir.mkdirs()
             // Only a protected system broadcast matches this filter, so exporting is moot.
+            // Delivered on the main thread: this thread sits in network calls for minutes,
+            // and a SCREEN_ON queued behind a run is a broadcast ANR.
             ContextCompat.registerReceiver(
-                context, screenReceiver, IntentFilter(Intent.ACTION_SCREEN_ON), null, handler,
+                context, screenReceiver, IntentFilter(Intent.ACTION_SCREEN_ON), null, null,
                 ContextCompat.RECEIVER_EXPORTED
             )
             log("start", "pid=${Process.myPid()} config=${configFile.exists()}")
