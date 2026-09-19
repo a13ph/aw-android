@@ -1,13 +1,17 @@
-From 7c9e9de660bf9d2a7c464afdb916ac4ae1087c07 Mon Sep 17 00:00:00 2001
+From f6221ac06da160e2b39f0004bf30a701eeec21a9 Mon Sep 17 00:00:00 2001
 From: a13ph <bestiarium@gmail.com>
 Date: Mon, 14 Sep 2026 11:07:26 +0000
 Subject: [PATCH] feat(timeline): show every bucket, keep short events visible,
  per-bucket hide list
 
+chartData sorts a copy of bucket.events. With the short-event filter off,
+the in-place sort mutated the parent's reactive array, which re-rendered
+the parent, handed a new buckets prop to VisTimeline and re-ran update()
+without end - the Timeline and Bucket pages froze.
 ---
  src/views/Timeline.vue             | 46 ++++++++++++++++++++++++++++++
- src/visualizations/VisTimeline.vue | 27 +++++++++---------
- 2 files changed, 59 insertions(+), 14 deletions(-)
+ src/visualizations/VisTimeline.vue | 31 ++++++++++----------
+ 2 files changed, 62 insertions(+), 15 deletions(-)
 
 diff --git a/src/views/Timeline.vue b/src/views/Timeline.vue
 index 06cb4a8..d201ddd 100644
@@ -109,7 +113,7 @@ index 06cb4a8..d201ddd 100644
 +}
  </style>
 diff --git a/src/visualizations/VisTimeline.vue b/src/visualizations/VisTimeline.vue
-index 90501f7..8920d6d 100644
+index 90501f7..1bbff00 100644
 --- a/src/visualizations/VisTimeline.vue
 +++ b/src/visualizations/VisTimeline.vue
 @@ -2,9 +2,6 @@
@@ -143,7 +147,18 @@ index 90501f7..8920d6d 100644
        items: [],
        groups: [],
        options: {
-@@ -385,7 +387,7 @@ export default {
+@@ -145,7 +147,9 @@ export default {
+         if (bucket.events === undefined) {
+           return;
+         }
+-        let events = bucket.events;
++        // A copy: sorting bucket.events in place mutates a reactive array,
++        // which re-renders the parent, re-runs update() and loops forever.
++        let events = [...bucket.events];
+         // Filter out events shorter than 1 second (notably including 0-duration events)
+         // TODO: Use flooding instead, preferably with some additional method of removing/simplifying short events for even greater performance
+         if (this.filterShortEvents) {
+@@ -385,7 +389,7 @@ export default {
          };
        });
  
@@ -152,7 +167,7 @@ index 90501f7..8920d6d 100644
          if (this.queriedInterval && this.showQueriedInterval) {
            const duration = this.queriedInterval[1].diff(this.queriedInterval[0], 'seconds');
            groups.push({ id: String(groups.length), content: 'queried interval' });
-@@ -415,17 +417,14 @@ export default {
+@@ -415,17 +419,14 @@ export default {
            const end =
              (this.queriedInterval && this.queriedInterval[1]) ||
              _.max(_.map(items, item => item.end));
