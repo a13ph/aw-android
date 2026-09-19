@@ -153,6 +153,12 @@ private fun File.readLongOrNull(): Long? =
  *
  * Touches logged "cc" or "adb" never make the user not-afk; the afk bucket holds only
  * the user's own state.
+ *
+ * `aw-watcher-screen_<host>` (type screen-state) holds the screen's state as spans
+ * `{screen: on|off}`, one per state, so its latest event is the state now and its
+ * timestamp is since when. A change at t first extends the old state's span to t, then
+ * starts the new one at t; the on span grows with every tick. At start the current state
+ * is written with pulsetime 0, so a span never bridges time the app did not see.
  */
 class IdleWatcher private constructor(private val context: Context) {
 
@@ -165,6 +171,8 @@ class IdleWatcher private constructor(private val context: Context) {
         private const val INJECT_S = 5L
         private const val SHELL_SPAN_S = 3.0
         private const val SHELL_PULSE_S = 10.0
+        // a screen span may be extended over a whole off period, days long
+        private const val SCREEN_PULSE_S = 14.0 * 86_400
         // bu (adb backup) is followed by a touch within a second, too soon for a finger
         private val INJECTORS = setOf("input", "monkey", "bu")
         private const val SHELL_FILTER =
@@ -206,6 +214,7 @@ class IdleWatcher private constructor(private val context: Context) {
     private val bucket = "aw-watcher-afk_$host"
     private val ccBucket = "aw-watcher-cc-phone_$host"
     private val adbBucket = "aw-watcher-adb_$host"
+    private val screenBucket = "aw-watcher-screen_$host"
     private val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
     }
@@ -224,6 +233,7 @@ class IdleWatcher private constructor(private val context: Context) {
     private var ccDone = 0L
     private var fails = 0
     private var dumpOk: Boolean? = null
+    private var screen: String? = null
 
     // Epoch s of recent input/monkey runs. Written by the logcat thread the moment it
     // reads the line, which comes before the injection, so a tick sees it in time.
@@ -280,8 +290,27 @@ class IdleWatcher private constructor(private val context: Context) {
     private fun granted(permission: String): Boolean =
         context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
 
+    // Writes the screen's state at `t` into the screen bucket (class comment).
+    private fun screenBeat(t: Long, on: Boolean) {
+        val cur = if (on) "on" else "off"
+        val prev = screen
+        if (prev == null) {
+            post(screenBucket, t, 0.0, JSONObject().put("screen", cur), 0.0)
+        } else {
+            if (prev != cur) post(screenBucket, t, 0.0, JSONObject().put("screen", prev), SCREEN_PULSE_S)
+            post(screenBucket, t, 0.0, JSONObject().put("screen", cur), SCREEN_PULSE_S)
+        }
+        if (prev != cur) life("screen-state", cur)
+        screen = cur
+    }
+
     private fun safeTick() {
         var next = INTERVAL_S
+        try {
+            screenBeat(now(), power.isInteractive)
+        } catch (t: Throwable) {
+            life("error", "screen: ${t.toString().take(300)}")
+        }
         try {
             next = doTick()
         } catch (t: Throwable) {
@@ -554,6 +583,7 @@ class IdleWatcher private constructor(private val context: Context) {
             ri?.createBucketHelper(bucket, "afkstatus", CLIENT)
             ri?.createBucketHelper(ccBucket, "cc-driving", CLIENT)
             ri?.createBucketHelper(adbBucket, "adb-shell", CLIENT)
+            ri?.createBucketHelper(screenBucket, "screen-state", CLIENT)
         } catch (e: Exception) {
             fails++
             Log.w(TAG, "bucket creation failed", e)
