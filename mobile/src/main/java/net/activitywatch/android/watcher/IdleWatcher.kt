@@ -166,6 +166,12 @@ private fun File.readLongOrNull(): Long? =
  * ACTION_BATTERY_CHANGED, read on every battery change and on POWER_CONNECTED /
  * POWER_DISCONNECTED: a plug-in at the bedside charger is a bedtime signal. The open span
  * grows with each battery change of the same state.
+ *
+ * `aw-watcher-battery_<host>` (type battery-stats) holds point samples for battery health
+ * and charging speed: level %, status, plugged, voltage, temperature, health, and where the
+ * phone exposes them current now/average, charge counter, energy counter and cycle count.
+ * Sparse on purpose (al doubts AW suits dense series): a sample only when the level,
+ * status or plug changes, or every BATTERY_CHARGING_EVERY_S while plugged in.
  */
 class IdleWatcher private constructor(private val context: Context) {
 
@@ -180,6 +186,8 @@ class IdleWatcher private constructor(private val context: Context) {
         private const val SHELL_PULSE_S = 10.0
         // a screen span may be extended over a whole off period, days long
         private const val SCREEN_PULSE_S = 14.0 * 86_400
+        // battery stats while plugged in: one sample per 3 min at most besides level changes
+        private const val BATTERY_CHARGING_EVERY_S = 180L
         // bu (adb backup) is followed by a touch within a second, too soon for a finger
         private val INJECTORS = setOf("input", "monkey", "bu")
         private const val SHELL_FILTER =
@@ -223,6 +231,7 @@ class IdleWatcher private constructor(private val context: Context) {
     private val adbBucket = "aw-watcher-adb_$host"
     private val screenBucket = "aw-watcher-screen_$host"
     private val powerBucket = "aw-watcher-power_$host"
+    private val batteryBucket = "aw-watcher-battery_$host"
     private val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
     }
@@ -264,11 +273,56 @@ class IdleWatcher private constructor(private val context: Context) {
             try {
                 val battery = if (intent.action == Intent.ACTION_BATTERY_CHANGED) intent
                 else context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-                powerBeat(now(), pluggedName(battery?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1))
+                val t = now()
+                powerBeat(t, pluggedName(battery?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1))
+                if (battery != null) batterySample(t, battery)
             } catch (t: Throwable) {
                 life("error", "power: ${t.toString().take(300)}")
             }
         }
+    }
+
+    private val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+    private var batKey: String? = null
+    private var batAt = 0L
+
+    private fun statusName(s: Int): String = when (s) {
+        BatteryManager.BATTERY_STATUS_CHARGING -> "charging"
+        BatteryManager.BATTERY_STATUS_DISCHARGING -> "discharging"
+        BatteryManager.BATTERY_STATUS_FULL -> "full"
+        BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "not-charging"
+        else -> "unknown"
+    }
+
+    // A property the phone does not expose reads Integer.MIN_VALUE (or 0 on some): left out.
+    private fun prop(id: Int): Int? = try {
+        batteryManager.getIntProperty(id).takeIf { it != Int.MIN_VALUE && it != 0 }
+    } catch (t: Throwable) { null }
+
+    // One point sample into the battery-stats bucket (class comment): only when the level,
+    // status or plug changes, or every BATTERY_CHARGING_EVERY_S while plugged in.
+    private fun batterySample(t: Long, b: Intent) {
+        val level = b.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = b.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+        val pl = b.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1)
+        val st = statusName(b.getIntExtra(BatteryManager.EXTRA_STATUS, -1))
+        val key = "$level/$st/${pluggedName(pl)}"
+        if (key == batKey && !(pl > 0 && t - batAt >= BATTERY_CHARGING_EVERY_S)) return
+        val d = JSONObject()
+            .put("level", if (scale > 0 && level >= 0) level * 100 / scale else level)
+            .put("status", st)
+            .put("plugged", pluggedName(pl))
+            .put("voltage_mv", b.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1))
+            .put("temp_c", b.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -10000) / 10.0)
+            .put("health", b.getIntExtra(BatteryManager.EXTRA_HEALTH, -1))
+        prop(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)?.let { d.put("current_ua", it) }
+        prop(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE)?.let { d.put("current_avg_ua", it) }
+        prop(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)?.let { d.put("charge_counter_uah", it) }
+        prop(BatteryManager.BATTERY_PROPERTY_ENERGY_COUNTER)?.let { d.put("energy_counter_nwh", it) }
+        b.getIntExtra("android.os.extra.CYCLE_COUNT", -1).takeIf { it >= 0 }?.let { d.put("cycle_count", it) }
+        post(batteryBucket, t, 0.0, d, 0.0)
+        batKey = key
+        batAt = t
     }
 
     private fun pluggedName(p: Int): String = when (p) {
@@ -638,6 +692,7 @@ class IdleWatcher private constructor(private val context: Context) {
             ri?.createBucketHelper(adbBucket, "adb-shell", CLIENT)
             ri?.createBucketHelper(screenBucket, "screen-state", CLIENT)
             ri?.createBucketHelper(powerBucket, "power-state", CLIENT)
+            ri?.createBucketHelper(batteryBucket, "battery-stats", CLIENT)
         } catch (e: Exception) {
             fails++
             Log.w(TAG, "bucket creation failed", e)
