@@ -33,5 +33,6 @@ class AWApplication : Application() {
 
         IdleWatcher.start(this)
         ProbookSync.start(this)
+        RunningNotifier.start(this)
     }
 }

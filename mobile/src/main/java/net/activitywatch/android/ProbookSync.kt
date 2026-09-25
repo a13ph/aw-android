@@ -468,9 +468,13 @@ class ProbookSync private constructor(private val context: Context) {
     }
 }
 
-/** The alarm, the break buttons and any `am broadcast` start a sync run through this. */
+/**
+ * The alarm, the break buttons and any `am broadcast` start a sync run through this.
+ * A button's broadcast also redraws the running-spans notification ([RunningNotifier]).
+ */
 class ProbookSyncReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         ProbookSync.kick(context)
+        RunningNotifier.refresh(context)
     }
 }
