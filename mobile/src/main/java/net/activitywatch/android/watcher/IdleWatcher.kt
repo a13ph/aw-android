@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.os.BatteryManager
 import android.os.DropBoxManager
 import android.os.Handler
 import android.os.HandlerThread
@@ -159,6 +160,12 @@ private fun File.readLongOrNull(): Long? =
  * timestamp is since when. A change at t first extends the old state's span to t, then
  * starts the new one at t; the on span grows with every tick. At start the current state
  * is written with pulsetime 0, so a span never bridges time the app did not see.
+ *
+ * `aw-watcher-power_<host>` (type power-state) holds the charger the same way, as spans
+ * `{plugged: ac|usb|wireless|dock|none}`, from EXTRA_PLUGGED of the sticky
+ * ACTION_BATTERY_CHANGED, read on every battery change and on POWER_CONNECTED /
+ * POWER_DISCONNECTED: a plug-in at the bedside charger is a bedtime signal. The open span
+ * grows with each battery change of the same state.
  */
 class IdleWatcher private constructor(private val context: Context) {
 
@@ -215,6 +222,7 @@ class IdleWatcher private constructor(private val context: Context) {
     private val ccBucket = "aw-watcher-cc-phone_$host"
     private val adbBucket = "aw-watcher-adb_$host"
     private val screenBucket = "aw-watcher-screen_$host"
+    private val powerBucket = "aw-watcher-power_$host"
     private val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
     }
@@ -234,6 +242,7 @@ class IdleWatcher private constructor(private val context: Context) {
     private var fails = 0
     private var dumpOk: Boolean? = null
     private var screen: String? = null
+    private var plugged: String? = null
 
     // Epoch s of recent input/monkey runs. Written by the logcat thread the moment it
     // reads the line, which comes before the injection, so a tick sees it in time.
@@ -248,6 +257,41 @@ class IdleWatcher private constructor(private val context: Context) {
             handler.removeCallbacks(tick)
             safeTick()
         }
+    }
+
+    private val powerReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, intent: Intent) {
+            try {
+                val battery = if (intent.action == Intent.ACTION_BATTERY_CHANGED) intent
+                else context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                powerBeat(now(), pluggedName(battery?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1))
+            } catch (t: Throwable) {
+                life("error", "power: ${t.toString().take(300)}")
+            }
+        }
+    }
+
+    private fun pluggedName(p: Int): String = when (p) {
+        0 -> "none"
+        BatteryManager.BATTERY_PLUGGED_AC -> "ac"
+        BatteryManager.BATTERY_PLUGGED_USB -> "usb"
+        BatteryManager.BATTERY_PLUGGED_WIRELESS -> "wireless"
+        8 -> "dock" // BATTERY_PLUGGED_DOCK, API 33
+        -1 -> "unknown"
+        else -> "other-$p"
+    }
+
+    // Writes the charger's state at `t` into the power bucket (class comment).
+    private fun powerBeat(t: Long, cur: String) {
+        val prev = plugged
+        if (prev == null) {
+            post(powerBucket, t, 0.0, JSONObject().put("plugged", cur), 0.0)
+        } else {
+            if (prev != cur) post(powerBucket, t, 0.0, JSONObject().put("plugged", prev), SCREEN_PULSE_S)
+            post(powerBucket, t, 0.0, JSONObject().put("plugged", cur), SCREEN_PULSE_S)
+        }
+        if (prev != cur) life("power-state", cur)
+        plugged = cur
     }
 
     private fun begin() {
@@ -277,6 +321,15 @@ class IdleWatcher private constructor(private val context: Context) {
             // Only protected system broadcasts match this filter, so exporting is moot.
             ContextCompat.registerReceiver(
                 context, screenReceiver, filter, null, handler, ContextCompat.RECEIVER_EXPORTED
+            )
+            // Sticky: the current state arrives at once, and is written with pulsetime 0.
+            val powerFilter = IntentFilter().apply {
+                addAction(Intent.ACTION_BATTERY_CHANGED)
+                addAction(Intent.ACTION_POWER_CONNECTED)
+                addAction(Intent.ACTION_POWER_DISCONNECTED)
+            }
+            ContextCompat.registerReceiver(
+                context, powerReceiver, powerFilter, null, handler, ContextCompat.RECEIVER_EXPORTED
             )
             ensureShellWatch()
             safeTick()
@@ -584,6 +637,7 @@ class IdleWatcher private constructor(private val context: Context) {
             ri?.createBucketHelper(ccBucket, "cc-driving", CLIENT)
             ri?.createBucketHelper(adbBucket, "adb-shell", CLIENT)
             ri?.createBucketHelper(screenBucket, "screen-state", CLIENT)
+            ri?.createBucketHelper(powerBucket, "power-state", CLIENT)
         } catch (e: Exception) {
             fails++
             Log.w(TAG, "bucket creation failed", e)
