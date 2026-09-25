@@ -46,6 +46,11 @@ private const val TAG = "ProbookSync"
  * Those `*_probook-nix` buckets are never pushed back. The mirror is written through
  * this phone's own HTTP API, the only one that deletes and replaces by id.
  *
+ * With the pull comes what probook's pills run right now; [PillMirror] turns that and the
+ * pulled spans into `via: probook` marks in the break-parts bucket, so the buttons and
+ * the running-spans notification show a break, meal or drink started or ended on
+ * probook. Those marks are never pushed back.
+ *
  * Runs every 2 min while the screen is on, on every screen-on, from an idle-allowed
  * alarm every 10 min, and when a [ACTION_KICK] broadcast arrives (the break buttons send
  * one after a tap). Does nothing until `files/probook-sync.json` holds `{"url", "key"}`.
@@ -71,6 +76,10 @@ class ProbookSync private constructor(private val context: Context) {
         private const val PULL_WINDOW_S = 2 * 86400L
         private const val PULL_FIRST_DAYS = 31L
         private const val LOCAL_API = "http://127.0.0.1:5600/api/0"
+        const val ACTION_MIRROR_TEST = "net.activitywatch.android.PILL_MIRROR_TEST"
+        private const val PARTS = "aw-watcher-break-parts_oneplus_5"
+        // the newest marks PillMirror reads: an overlay runs up to 12 h, a day's taps fit
+        private const val MIRROR_READ = 300
 
         private var instance: ProbookSync? = null
 
@@ -84,6 +93,11 @@ class ProbookSync private constructor(private val context: Context) {
         fun kick(context: Context) {
             start(context)
             instance?.kick()
+        }
+
+        fun mirrorTest(context: Context, partsId: String) {
+            start(context)
+            instance?.mirrorTest(partsId)
         }
     }
 
@@ -247,6 +261,8 @@ class ProbookSync private constructor(private val context: Context) {
             val start = OffsetDateTime.parse(timestamp).toInstant().toEpochMilli()
             val duration = e.optDouble("duration", 0.0)
             val data = e.optJSONObject("data") ?: JSONObject()
+            // PillMirror's echoes of what probook runs: probook holds the original.
+            if (data.optString("via") == PillMirror.VIA) continue
             if (start < oldest) oldest = start
             seen.add(pid)
             val fp = sha1("$timestamp|$duration|$data")
@@ -375,7 +391,69 @@ class ProbookSync private constructor(private val context: Context) {
             save(stateFile, state.put("maps", maps))
         }
         save(stateFile, state.put("maps", maps).put("pulled", true))
+        // A relay from before the pills answers without them: nothing to mirror.
+        if (reply.has("pills")) {
+            val pulled = buckets.keys().asSequence().associateWith { buckets.getJSONObject(it).getJSONArray("events") }
+            changed += mirrorPills(reply.optJSONObject("pills"), pulled, PARTS, System.currentTimeMillis())
+        }
         return changed
+    }
+
+    /**
+     * Writes [PillMirror.plan]'s marks into [partsId] on this phone, so its buttons and the
+     * running-spans notification show what probook's pills run. Returns how many it wrote.
+     */
+    private fun mirrorPills(pills: JSONObject?, pulled: Map<String, JSONArray>, partsId: String, nowMs: Long): Int {
+        val rust = ri ?: RustInterface(context).also { ri = it }
+        if (!JSONObject(rust.getBuckets()).has(partsId)) return 0
+        val actions = PillMirror.plan(rust.getEventsJSON(partsId, MIRROR_READ), pills, pulled, nowMs)
+        if (actions.isEmpty()) return 0
+        val localKey = ensureDashboardApiKey(context)
+        val url = "$LOCAL_API/buckets/$partsId/events"
+        val done = ArrayList<String>()
+        for (a in actions) {
+            when (a) {
+                is PillMirror.Action.Post -> request(url, "POST", localKey, JSONArray().put(a.event).toString())
+                is PillMirror.Action.Replace ->
+                    request(url, "POST", localKey, JSONArray().put(JSONObject(a.event.toString()).put("id", a.id)).toString())
+                is PillMirror.Action.Delete -> request("$url/${a.id}", "DELETE", localKey, null, okCodes = setOf(404))
+            }
+            done.add(describe(a))
+        }
+        log("mirror", "$partsId: ${done.joinToString("; ")}")
+        RunningNotifier.refresh(context)
+        return actions.size
+    }
+
+    private fun describe(a: PillMirror.Action): String = when (a) {
+        is PillMirror.Action.Post -> a.event.getJSONObject("data").let {
+            "${it.optString("mark")} ${it.optString("reason")} at ${a.event.optString("timestamp")}".replace("  ", " ")
+        }
+        is PillMirror.Action.Replace -> "reason of ${a.id} -> ${a.event.getJSONObject("data").optString("reason")}"
+        is PillMirror.Action.Delete -> "delete ${a.id}"
+    }
+
+    /**
+     * [ACTION_MIRROR_TEST]: runs [mirrorPills] on a `-test` parts bucket with the pills and
+     * pulled spans in `pill-mirror-test.json` (external files dir: {"pills", "pulled":
+     * {bucket: events}, "now"?}), and writes what it did to `aw-pill-mirror-test.status`.
+     * Only a bucket named `-test` is ever written, so a stray broadcast can touch no real data.
+     */
+    fun mirrorTest(partsId: String) {
+        handler.post {
+            val out = File(dir, "aw-pill-mirror-test.status")
+            try {
+                if (!partsId.contains("-test")) throw IOException("not a -test bucket: $partsId")
+                val input = JSONObject(File(dir, "pill-mirror-test.json").readText())
+                val p = input.optJSONObject("pulled") ?: JSONObject()
+                val pulled = p.keys().asSequence().associateWith { p.getJSONArray(it) }
+                val nowMs = input.optLong("now", System.currentTimeMillis())
+                val n = mirrorPills(input.optJSONObject("pills"), pulled, partsId, nowMs)
+                out.writeText("${isoFormat.format(Date())} ok wrote=$n\n")
+            } catch (t: Throwable) {
+                out.writeText("${isoFormat.format(Date())} fail ${t.toString().take(300)}\n")
+            }
+        }
     }
 
     /** The answer body of a 2xx (or of a code in [okCodes]); anything else throws. */
@@ -474,6 +552,10 @@ class ProbookSync private constructor(private val context: Context) {
  */
 class ProbookSyncReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == ProbookSync.ACTION_MIRROR_TEST) {
+            ProbookSync.mirrorTest(context, intent.getStringExtra("parts") ?: "")
+            return
+        }
         ProbookSync.kick(context)
         RunningNotifier.refresh(context)
     }

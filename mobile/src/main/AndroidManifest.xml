@@ -84,6 +84,8 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="net.activitywatch.android.PROBOOK_SYNC" />
+                <!-- PillMirror on a -test bucket from a file in the app's own dir -->
+                <action android:name="net.activitywatch.android.PILL_MIRROR_TEST" />
             </intent-filter>
         </receiver>
 

@@ -13,7 +13,7 @@ import java.time.OffsetDateTime
  * - the break-parts bucket: the part runs while the newest start/end/stop mark is a
  *   `start` younger than [PART_CAP_MS] (the fold's cap); an overlay (`+cu talk`) runs
  *   while its newest overlay-start/overlay-end mark is an `overlay-start` younger than
- *   [OVERLAY_CAP_MS]
+ *   [OVERLAY_CAP_MS]; one [PillMirror] echoed from a probook pill is labelled «(pc)»
  * - probook's mirrored buckets (`*_probook-nix`) are never read; a `-test` bucket is read
  *   and its items are marked `(test)`, so a test build of the buttons shows here too
  */
@@ -57,23 +57,25 @@ object RunningSpans {
 
     /** The running break part and the open overlays of the break-parts bucket. */
     fun fromParts(bucketId: String, events: JSONArray, nowMs: Long): List<Item> {
+        // a mark PillMirror echoed from probook's pill says so: «(pc)»
+        data class M(val t: Long, val mark: String, val reason: String, val pc: String)
         val marks = objects(events).mapNotNull { e ->
             val d = e.optJSONObject("data") ?: return@mapNotNull null
             val t = parseMs(e.optString("timestamp")) ?: return@mapNotNull null
-            Triple(t, d.optString("mark", ""), d.optString("reason", ""))
-        }.sortedByDescending { it.first }
+            M(t, d.optString("mark", ""), d.optString("reason", ""), if (d.optString("via") == "probook") " (pc)" else "")
+        }.sortedByDescending { it.t }
         val out = ArrayList<Item>()
-        marks.firstOrNull { it.second in setOf("start", "end", "stop") }?.let { (t, mark, reason) ->
-            if (mark == "start" && nowMs - t < PART_CAP_MS) {
-                out.add(Item(reason.ifEmpty { "break part" } + testMark(bucketId), t, "part"))
+        marks.firstOrNull { it.mark in setOf("start", "end", "stop") }?.let { m ->
+            if (m.mark == "start" && nowMs - m.t < PART_CAP_MS) {
+                out.add(Item(m.reason.ifEmpty { "break part" } + m.pc + testMark(bucketId), m.t, "part"))
             }
         }
         val seen = HashSet<String>()
-        for ((t, mark, reason) in marks) {
-            if (mark != "overlay-start" && mark != "overlay-end") continue
-            if (!seen.add(reason)) continue
-            if (mark == "overlay-start" && nowMs - t < OVERLAY_CAP_MS) {
-                out.add(Item("+" + reason.ifEmpty { "overlay" } + testMark(bucketId), t, "overlay"))
+        for (m in marks) {
+            if (m.mark != "overlay-start" && m.mark != "overlay-end") continue
+            if (!seen.add(m.reason)) continue
+            if (m.mark == "overlay-start" && nowMs - m.t < OVERLAY_CAP_MS) {
+                out.add(Item("+" + m.reason.ifEmpty { "overlay" } + m.pc + testMark(bucketId), m.t, "overlay"))
             }
         }
         return out
