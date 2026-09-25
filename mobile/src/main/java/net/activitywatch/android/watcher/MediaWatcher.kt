@@ -24,8 +24,6 @@ import org.threeten.bp.Instant
  *
  * Bucket: aw-watcher-android-media
  * Event data: app, title, artist, album, state (playing/paused/stopped)
- *
- * The same listener feeds NotificationRecorder (aw-watcher-notifications_<host>).
  */
 class MediaWatcher : NotificationListenerService() {
 
@@ -64,7 +62,6 @@ class MediaWatcher : NotificationListenerService() {
     private var handler: android.os.Handler? = null
     private var pollingRunnable: Runnable? = null
     private val handlerThread = HandlerThread("MediaWatcher").also { it.start() }
-    private val notifications by lazy { NotificationRecorder(applicationContext) }
 
     override fun onCreate() {
         super.onCreate()
@@ -118,16 +115,13 @@ class MediaWatcher : NotificationListenerService() {
         handlerThread.quitSafely()
     }
 
-    // Media tracking relies on MediaSessionManager; the notification callbacks feed
-    // NotificationRecorder, on handlerThread like everything else here.
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        if (sbn == null) return
-        handler?.post { ri?.let { notifications.posted(it, sbn) } }
+        // We rely on MediaSessionManager for media tracking, not individual notifications.
+        // This callback is required by NotificationListenerService but we don't need it.
     }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
-        if (sbn == null) return
-        handler?.post { notifications.removed(sbn) }
+        // Not needed for media tracking.
     }
 
     /**
